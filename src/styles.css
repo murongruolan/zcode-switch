@@ -184,6 +184,27 @@ input:focus-visible,
 }
 .led-text b { color: var(--ink); font-weight: 600; }
 
+/* 账号库标题右侧：活动标识（第一行 = 当前，第二行 = 上次） */
+.act-tags {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin-left: 10px;
+  margin-right: auto;
+  min-width: 0;
+  max-width: 64%;
+}
+.act-tag {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1.35;
+  color: var(--ink-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.act-tag.prev { color: var(--ink-mute); opacity: .72; }
+
 .section-head {
   display: flex;
   align-items: baseline;
@@ -312,6 +333,9 @@ input:focus-visible,
 }
 .icon-btn:hover { color: var(--ink); border-color: var(--hairline); background: var(--panel-2); }
 .icon-btn.danger:hover { color: var(--red); border-color: var(--red-dim); background: rgba(224, 82, 82, .08); }
+.icon-btn.spinning { color: var(--ink); }
+.icon-btn.spinning .ic { animation: spin 1s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
 
 .btn-switch {
   border: 1px solid var(--amber-deep);

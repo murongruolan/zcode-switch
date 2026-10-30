@@ -217,7 +217,13 @@ async fn claim_preview(id: String) -> Result<Vec<claim::ClaimPlan>, String> {
     let paths = Paths::detect();
     let mid = store::ensure_virtual_device_mid(&paths, &id)?;
     let acc = load_account(&paths, &id)?;
-    claim::preview_plans(&paths.home, &acc.credentials, acc.config.as_ref(), Some(mid))
+    claim::preview_plans(&paths.home, &acc.id, &acc.credentials, acc.config.as_ref(), Some(mid))
+}
+
+/// 活动池历史（最近见到的排前面）：给界面显示「当前 / 上次」的活动标识。
+#[tauri::command]
+async fn claim_activities() -> Vec<claim::ActivityEntry> {
+    claim::activity_history(&Paths::detect().home)
 }
 
 #[derive(serde::Serialize)]
@@ -241,7 +247,7 @@ async fn claim_refresh(id: String) -> Result<ClaimRefreshResult, String> {
             },
             None => (false, None),
         };
-    let plans = claim::preview_plans(&paths.home, &acc.credentials, acc.config.as_ref(), Some(mid))?;
+    let plans = claim::preview_plans(&paths.home, &acc.id, &acc.credentials, acc.config.as_ref(), Some(mid))?;
     Ok(ClaimRefreshResult { plans, activated, activation_error })
 }
 
@@ -255,7 +261,7 @@ async fn claim_start(
     let paths = Paths::detect();
     let mid = store::ensure_virtual_device_mid(&paths, &id)?;
     let acc = load_account(&paths, &id)?;
-    let plans = claim::preview_plans(&paths.home, &acc.credentials, acc.config.as_ref(), Some(mid.clone()))?;
+    let plans = claim::preview_plans(&paths.home, &acc.id, &acc.credentials, acc.config.as_ref(), Some(mid.clone()))?;
     let plan = plans
         .iter()
         .find(|p| p.plan_id == plan_id)
@@ -1144,6 +1150,7 @@ pub fn run() {
             get_live_quota,
             get_account_quota,
             claim_preview,
+            claim_activities,
             claim_refresh,
             claim_start,
             claim_captcha_config,

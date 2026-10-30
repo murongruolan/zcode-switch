@@ -1,25 +1,26 @@
 
 use crate::quota;
 use crate::zcrypto;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
 use std::time::Duration;
 
 pub const BILLING_PREVIEW_URL: &str = "https://zcode.z.ai/api/v1/zcode-plan/billing/preview";
 pub const BILLING_CLAIM_URL: &str = "https://zcode.z.ai/api/v1/zcode-plan/billing/claim";
+pub const BILLING_BALANCE_URL: &str = "https://zcode.z.ai/api/v1/zcode-plan/billing/balance";
 pub const CLIENT_CONFIGS_URL: &str = "https://zcode.z.ai/api/v1/client/configs";
 
 const CLAIM_TIMEOUT_SECS: u64 = 25;
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ClaimGrant {
     pub name: String,
     pub units: f64,
     pub period: String,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ClaimPlan {
     pub plan_id: String,
     pub name: String,
@@ -214,8 +215,268 @@ pub fn report_activation_events(user_id: &str, device_mid: &str) -> Result<(), S
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// preview 空时的 plan_id 兜底缓存。
+//
+// 背景：服务端 /billing/preview 会返回 `{"code":0,"msg":""}`（没有 data），但同一
+// 账号、同一个 plan_id 去 POST /billing/claim 却可能成功。ZCode 客户端之所以还能
+// 显示“领取”，是因为它把上一次见到的 plan_id 留在本地缓存里，preview 空了照样拿
+// 缓存去 claim。z-switch 之前只认 preview，于是显示“没有可领取”，也就没有入口。
+// 这里补上同样的缓存层：preview 有数据就写入缓存，preview 空就回退到缓存。
+//   ZSW_CLAIM_FROM_CACHE=0  关闭兜底（对照实验用）
+//   ZSW_NO_PLAN_CACHE=1     不写缓存
+// ---------------------------------------------------------------------------
+const PLAN_CACHE_FILE: &str = "claim-plan-cache.json";
+const PLAN_CACHE_TTL_SECS: i64 = 7 * 24 * 3600;
+
+fn plan_cache_path(home: &Path) -> std::path::PathBuf {
+    home.join(".zcode-switch").join(PLAN_CACHE_FILE)
+}
+
+fn read_plan_cache(home: &Path) -> serde_json::Map<String, Value> {
+    std::fs::read_to_string(plan_cache_path(home))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+fn save_plan_cache(home: &Path, account_id: &str, plans: &[ClaimPlan]) {
+    if std::env::var("ZSW_NO_PLAN_CACHE").map(|v| v == "1").unwrap_or(false) {
+        return;
+    }
+    let mut map = read_plan_cache(home);
+    map.insert(
+        account_id.to_string(),
+        serde_json::json!({
+            "saved_at": chrono::Utc::now().timestamp(),
+            "plans": plans,
+        }),
+    );
+    let path = plan_cache_path(home);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(text) = serde_json::to_string_pretty(&Value::Object(map)) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
+fn cached_plans(home: &Path, account_id: &str) -> Vec<ClaimPlan> {
+    let map = read_plan_cache(home);
+    let Some(entry) = map.get(account_id) else {
+        return vec![];
+    };
+    let saved_at = entry.get("saved_at").and_then(|v| v.as_i64()).unwrap_or(0);
+    if saved_at > 0 && chrono::Utc::now().timestamp() - saved_at > PLAN_CACHE_TTL_SECS {
+        return vec![];
+    }
+    entry
+        .get("plans")
+        .and_then(|v| serde_json::from_value::<Vec<ClaimPlan>>(v.clone()).ok())
+        .unwrap_or_default()
+}
+
+/// balance 里已存在的 plan_id = 这个账号“已经拿到过”的套餐（领取后才会出现在 balance）。
+/// 返回 None 表示没问到（网络/接口失败，重试一次仍失败），此时不做任何猜测。
+fn balance_snapshot(token: &str, mid: Option<String>) -> Option<(Vec<String>, Vec<ClaimPlan>)> {
+    let url = format!(
+        "{BILLING_BALANCE_URL}?app_version={}&platform={}",
+        quota::zcode_app_version(),
+        quota::client_platform()
+    );
+    for attempt in 0..2 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(700));
+        }
+        if let Ok(plans) = preview_once(&url, token, mid.clone()) {
+            let ids = plans.iter().map(|p| p.plan_id.clone()).collect();
+            return Some((ids, plans));
+        }
+    }
+    None
+}
+
+/// 把已经拥有的 plan_id 从缓存里剔掉，避免“领过的还挂在缓存里”反复出现。
+fn prune_plan_cache(home: &Path, account_id: &str, owned: &[String]) {
+    if owned.is_empty() {
+        return;
+    }
+    let mut map = read_plan_cache(home);
+    let Some(entry) = map.get(account_id).cloned() else {
+        return;
+    };
+    let plans: Vec<ClaimPlan> = entry
+        .get("plans")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let kept: Vec<ClaimPlan> = plans
+        .into_iter()
+        .filter(|p| !owned.iter().any(|id| id == &p.plan_id))
+        .collect();
+    if kept.is_empty() {
+        map.remove(account_id);
+    } else {
+        map.insert(
+            account_id.to_string(),
+            serde_json::json!({
+                "saved_at": chrono::Utc::now().timestamp(),
+                "plans": kept,
+            }),
+        );
+    }
+    let path = plan_cache_path(home);
+    if let Ok(text) = serde_json::to_string_pretty(&Value::Object(map)) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
+/// 活动池：记录“这台机器见过的活动 plan_id”，与账号无关。
+/// 领取过的账号会在 per-account 缓存里被剪掉，但活动本身仍然存在——
+/// 新登录的号要靠这个池子才知道“现在有哪个活动可领”。
+const ACTIVITY_KEY: &str = "__activity";
+const ACTIVITY_TTL_SECS: i64 = 36 * 3600;
+
+fn write_plan_cache(home: &Path, map: serde_json::Map<String, Value>) {
+    let path = plan_cache_path(home);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(text) = serde_json::to_string_pretty(&Value::Object(map)) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
+/// 活动池的一条记录。plan_id 是活动级标识（例：zcode-v3-start-plan-1030-wk），
+/// 同一个活动对所有账号通用，所以它可以跨账号复用。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivityEntry {
+    pub plan_id: String,
+    pub name: String,
+    pub first_seen: i64,
+    pub last_seen: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<ClaimPlan>,
+}
+
+/// 兼容旧格式（`{saved_at, plans:[ClaimPlan]}`）并读出 history。
+fn read_activity(home: &Path) -> Vec<ActivityEntry> {
+    let map = read_plan_cache(home);
+    let Some(entry) = map.get(ACTIVITY_KEY) else {
+        return vec![];
+    };
+    if let Some(history) = entry
+        .get("history")
+        .and_then(|v| serde_json::from_value::<Vec<ActivityEntry>>(v.clone()).ok())
+    {
+        return history;
+    }
+    // 旧格式迁移：把 plans 数组折成 history。
+    let saved_at = entry.get("saved_at").and_then(|v| v.as_i64()).unwrap_or(0);
+    entry
+        .get("plans")
+        .and_then(|v| serde_json::from_value::<Vec<ClaimPlan>>(v.clone()).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| ActivityEntry {
+            plan_id: p.plan_id.clone(),
+            name: p.name.clone(),
+            first_seen: saved_at,
+            last_seen: saved_at,
+            plan: Some(p),
+        })
+        .collect()
+}
+
+fn write_activity(home: &Path, history: &[ActivityEntry]) {
+    let mut map = read_plan_cache(home);
+    map.insert(
+        ACTIVITY_KEY.to_string(),
+        serde_json::json!({
+            "saved_at": chrono::Utc::now().timestamp(),
+            "history": history,
+        }),
+    );
+    write_plan_cache(home, map);
+}
+
+fn save_activity(home: &Path, plans: &[ClaimPlan]) {
+    if plans.is_empty() {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let mut history = read_activity(home);
+    for p in plans {
+        if let Some(e) = history.iter_mut().find(|e| e.plan_id == p.plan_id) {
+            e.last_seen = now;
+            e.name = p.name.clone();
+            e.plan = Some(p.clone());
+        } else {
+            history.push(ActivityEntry {
+                plan_id: p.plan_id.clone(),
+                name: p.name.clone(),
+                first_seen: now,
+                last_seen: now,
+                plan: Some(p.clone()),
+            });
+        }
+    }
+    write_activity(home, &history);
+}
+
+/// 活动历史，最近见到的排前面（给 UI 显示「当前 / 上次」用）。
+pub fn activity_history(home: &Path) -> Vec<ActivityEntry> {
+    let mut history = read_activity(home);
+    history.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+    history
+}
+
+/// 仍在有效期内的活动，用于给账号生成可领候选。
+fn activity_plans(home: &Path) -> Vec<ClaimPlan> {
+    let now = chrono::Utc::now().timestamp();
+    read_activity(home)
+        .into_iter()
+        .filter(|e| e.last_seen <= 0 || now - e.last_seen <= ACTIVITY_TTL_SECS)
+        .filter_map(|e| e.plan)
+        .collect()
+}
+
+/// 同一个活动对所有账号用的是同一个 plan_id（例：zcode-v3-start-plan-1030-wk）。
+/// 所以别的账号见过的活动，也应当能当这个账号的候选——否则新登录的号永远看不到
+/// 这种“按活动发、而不是按账号发”的额度。
+fn candidate_plans(home: &Path, account_id: &str) -> Vec<ClaimPlan> {
+    let mut out = cached_plans(home, account_id);
+    for p in activity_plans(home) {
+        if !out.iter().any(|c| c.plan_id == p.plan_id) {
+            out.push(p);
+        }
+    }
+    let map = read_plan_cache(home);
+    for (key, entry) in map.iter() {
+        if key == account_id {
+            continue;
+        }
+        let saved_at = entry.get("saved_at").and_then(|v| v.as_i64()).unwrap_or(0);
+        if saved_at > 0 && chrono::Utc::now().timestamp() - saved_at > PLAN_CACHE_TTL_SECS {
+            continue;
+        }
+        if let Some(plans) = entry
+            .get("plans")
+            .and_then(|v| serde_json::from_value::<Vec<ClaimPlan>>(v.clone()).ok())
+        {
+            for p in plans {
+                if !out.iter().any(|c| c.plan_id == p.plan_id) {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out
+}
+
 pub fn preview_plans(
     home: &Path,
+    account_id: &str,
     creds: &Value,
     config: Option<&Value>,
     device_mid: Option<String>,
@@ -227,7 +488,70 @@ pub fn preview_plans(
         quota::zcode_app_version(),
         quota::client_platform()
     );
-    preview_once(&url, &token, device_mid)
+    let mid_for_balance = device_mid.clone();
+    let preview = preview_once(&url, &token, device_mid);
+
+    // 1) preview 有数据 = 服务端确认可领，直接用（不再多打一次 balance）。
+    if let Ok(plans) = &preview {
+        if !plans.is_empty() {
+            save_plan_cache(home, account_id, plans);
+            save_activity(home, plans);
+            crate::flowlog::log(
+                "claim",
+                "preview",
+                &format!("account={account_id} plans={}", plans.len()),
+            );
+            return Ok(plans.clone());
+        }
+        crate::flowlog::log("claim", "preview-empty", &format!("account={account_id}"));
+    } else if let Err(e) = &preview {
+        crate::flowlog::log(
+            "claim",
+            "preview-err",
+            &format!("account={account_id} {}", e.trim()),
+        );
+    }
+    if std::env::var("ZSW_CLAIM_FROM_CACHE").map(|v| v == "0").unwrap_or(false) {
+        return preview;
+    }
+
+    // 2) preview 空：用 balance 判断“这个 plan 是不是已经领过了”。
+    //    balance 里有的 plan_id = 已领取，绝不显示；只有“见过但还没拥有”的才显示。
+    let Some((owned_ids, owned_plans)) = balance_snapshot(&token, mid_for_balance) else {
+        crate::flowlog::log(
+            "claim",
+            "cache-skip",
+            &format!("account={account_id} reason=balance-unavailable"),
+        );
+        return preview;
+    };
+    // 把本次看到的活动记进活动池：即使这个号已经领过，别的号也该知道有这回事。
+    save_activity(home, &owned_plans);
+    prune_plan_cache(home, account_id, &owned_ids);
+    let candidates = candidate_plans(home, account_id);
+    let cand_n = candidates.len();
+    let fresh: Vec<ClaimPlan> = candidates
+        .into_iter()
+        .filter(|p| !owned_ids.iter().any(|id| id == &p.plan_id))
+        .collect();
+    if fresh.is_empty() {
+        crate::flowlog::log(
+            "claim",
+            "cache-none",
+            &format!("account={account_id} candidates={cand_n} owned={}", owned_ids.len()),
+        );
+        return preview;
+    }
+    crate::flowlog::log(
+        "claim",
+        "preview-cache",
+        &format!(
+            "account={account_id} plans={} owned={}",
+            fresh.len(),
+            owned_ids.len()
+        ),
+    );
+    Ok(fresh)
 }
 
 fn http_err(prefix: &str, e: ureq::Error) -> String {

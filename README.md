@@ -4,6 +4,16 @@
 
 Tauri 2 桌面工具：在多个 ZCode 账号之间一键切换，自动显示额度。只换登录身份——项目、会话、设置全部共用不动。
 
+> **这是 fork**：[murongruolan/zcode-switch](https://github.com/murongruolan/zcode-switch) ｜ 上游：[pjpv/zcode-switch](https://github.com/pjpv/zcode-switch)
+>
+> `main` 只跟踪上游，改动都在 `feat/*` 分支。本 fork 基于 `v1.6.0` 多做了三件事：
+>
+> 1. **修复「明明有活动却显示没有可领取」**：不再只认 `billing/preview`，改为「活动池 + `balance` 已领过滤」；领过的账号不会再出现「领取」按钮
+> 2. **账号库标题右侧显示活动标识**：两行小字 `plan_id · 活动名`，第一行是当前、第二行是上次
+> 3. **合入上游 [PR #34](https://github.com/pjpv/zcode-switch/pull/34)**：账号行内单账号「刷新资格」按钮
+>
+> 机制与判定表见 [docs/CLAIM-ACTIVITY.md](docs/CLAIM-ACTIVITY.md)，构建见 [docs/BUILD.md](docs/BUILD.md)，变更见 [CHANGELOG.md](CHANGELOG.md)。
+
 ![screenshot](docs/screenshot.png)
 
 ## 功能

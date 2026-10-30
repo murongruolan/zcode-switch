@@ -4,6 +4,16 @@
 
 A Tauri 2 desktop tool for one-click switching between multiple ZCode accounts, with live quota display. Only the login identity changes — projects, sessions, settings and plugins all stay untouched.
 
+> **This is a fork**: [murongruolan/zcode-switch](https://github.com/murongruolan/zcode-switch) ｜ upstream: [pjpv/zcode-switch](https://github.com/pjpv/zcode-switch)
+>
+> `main` tracks upstream only; all changes live on `feat/*` branches. On top of `v1.6.0` this fork adds:
+>
+> 1. **Fix for "promotion exists but tool says nothing is claimable"** — no longer trusts `billing/preview` alone; uses an activity pool plus a `balance`-based "already owned" filter, so claimed accounts never show a Claim button again
+> 2. **Activity tag next to the account list header** — two small lines `plan_id · name`: current on the first line, previous on the second
+> 3. **Upstream [PR #34](https://github.com/pjpv/zcode-switch/pull/34) merged** — per-account "refresh eligibility" button in the account row
+>
+> Mechanism and decision table: [docs/CLAIM-ACTIVITY.md](docs/CLAIM-ACTIVITY.md). Build: [docs/BUILD.md](docs/BUILD.md). Changes: [CHANGELOG.md](CHANGELOG.md).
+
 ![screenshot](docs/screenshot.png)
 
 ## Features
