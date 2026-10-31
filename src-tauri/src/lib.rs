@@ -5,6 +5,7 @@ mod claim;
 mod flowlog;
 mod oauth;
 mod quota;
+mod slots;
 mod store;
 mod zcrypto;
 
@@ -198,6 +199,12 @@ async fn switch_to(app: AppHandle, id: String, force: bool, restart: bool) -> Re
     let paths = Paths::detect();
     let hot = load_settings(&paths).hot_switch();
     let r = store::switch_to(&paths, &id, force, restart, hot);
+    if r.is_ok() {
+        // 切换后 live 已指向目标账号；若这次顺带启动了默认实例，记下是它。
+        // 注：这里不写 default mid —— 该实例是用这个账号的 mid 启动的，
+        // 同账号已被置灰保证不会与任何槽撞车。
+        slots::record_default_slot(&paths);
+    }
     rebuild_tray(&app);
     r
 }
@@ -1118,6 +1125,12 @@ async fn launch_zcode(app: AppHandle) -> Result<(), String> {
     if !ok {
         return Err(i18n::trf("err.zcode.path_invalid_hint", &[("p", &p)]));
     }
+    // 默认实例用自己的固定 mid：否则它会和某个槽共用同一个值，
+    // 服务端把两个客户端算成同一台设备，subagent 额度就串了。
+    let mid = slots::ensure_default_mid(&paths);
+    let _ = write_live_device_mid(&paths, &mid);
+    // 记下这个实例用的是哪个账号（之后 live 会被别的槽改写）
+    slots::record_default_slot(&paths);
     let r = store::launch_zcode(&p);
     rebuild_tray(&app);
     r
@@ -1126,6 +1139,51 @@ async fn launch_zcode(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 async fn open_external(url: String) -> Result<(), String> {
     store::open_url(&url)
+}
+
+// ---- 多开槽 ----
+// 每个槽是一个独立的 ZCode 客户端（独立 userData），各自持有自己的 subagent 并发槽。
+// 不改客户端上限，只做隔离。
+
+#[tauri::command]
+async fn slots_list() -> Result<Vec<slots::SlotView>, String> {
+    let paths = Paths::detect();
+    Ok(slots::views(&paths))
+}
+
+#[tauri::command]
+async fn slot_open(account_id: Option<String>) -> Result<(), String> {
+    let _guard = store_guard();
+    let paths = Paths::detect();
+    let slot = slots::create_slot(&paths, account_id)?;
+    slots::launch_slot(&paths, &slot)
+}
+
+#[tauri::command]
+async fn slot_assign(id: String, account_id: String) -> Result<(), String> {
+    let _guard = store_guard();
+    let paths = Paths::detect();
+    slots::assign(&paths, &id, &account_id).map(|_| ())
+}
+
+#[tauri::command]
+async fn slot_kill(app: AppHandle, id: String) -> Result<(), String> {
+    let _guard = store_guard();
+    let paths = Paths::detect();
+    let ok = slots::kill_slot(&paths, &id)?;
+    rebuild_tray(&app);
+    if ok {
+        Ok(())
+    } else {
+        Err("槽进程未能在超时内退出".into())
+    }
+}
+
+#[tauri::command]
+async fn slot_remove(id: String) -> Result<(), String> {
+    let _guard = store_guard();
+    let paths = Paths::detect();
+    slots::remove_slot(&paths, &id)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1173,6 +1231,11 @@ pub fn run() {
             pick_zcode_path,
             set_zcode_path,
             launch_zcode,
+            slots_list,
+            slot_open,
+            slot_assign,
+            slot_kill,
+            slot_remove,
             open_external,
             open_settings,
             reveal_main,

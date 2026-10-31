@@ -13,19 +13,19 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 #[cfg(windows)]
-fn no_window(prog: &str) -> std::process::Command {
+pub(crate) fn no_window(prog: &str) -> std::process::Command {
     use std::os::windows::process::CommandExt;
     let mut c = std::process::Command::new(prog);
     c.creation_flags(0x0800_0000);
     c
 }
 #[cfg(not(windows))]
-fn no_window(prog: &str) -> std::process::Command {
+pub(crate) fn no_window(prog: &str) -> std::process::Command {
     std::process::Command::new(prog)
 }
 
 #[cfg(windows)]
-fn detached(mut c: std::process::Command) -> std::process::Command {
+pub(crate) fn detached(mut c: std::process::Command) -> std::process::Command {
     use std::os::windows::process::CommandExt;
     c.creation_flags(0x0000_0008 | 0x0000_0200);
     c

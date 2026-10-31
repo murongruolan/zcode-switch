@@ -1060,3 +1060,53 @@ input:focus-visible,
 .pv-item:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
 .pv-item .pv-arrow { color: var(--ink-mute); font-family: var(--mono); }
 .pv-actions { display: flex; justify-content: flex-end; margin-top: 14px; }
+
+/* ---- 切换气泡（选择把账号登录到哪个客户端 / 多开） ---- */
+.sw-pop {
+  position: fixed;
+  z-index: 80;
+  min-width: 220px;
+  max-width: 300px;
+  max-height: min(340px, 62vh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 6px;
+  background: var(--panel-2);
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, .45);
+  font-family: var(--body);
+  font-size: 13px;
+  color: var(--ink);
+}
+.sw-head {
+  padding: 6px 9px 8px;
+  font-size: 12px;
+  color: var(--ink-mute);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sw-list { display: flex; flex-direction: column; gap: 2px; }
+.sw-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.sw-item:hover { background: rgba(255, 255, 255, .06); border-color: var(--hairline); }
+.sw-item:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+.sw-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sw-tag { font-size: 11px; color: var(--ink-mute); font-family: var(--mono); white-space: nowrap; }
+.sw-empty { padding: 8px 10px; font-size: 12px; color: var(--ink-mute); }
+.sw-sep { height: 1px; margin: 5px 6px; background: var(--hairline); }
+.sw-multi { color: var(--amber); }
+.sw-plus { width: 14px; text-align: center; font-weight: 700; font-family: var(--mono); }

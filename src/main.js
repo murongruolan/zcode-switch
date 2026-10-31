@@ -55,10 +55,117 @@ function idLabel(id) {
   return id.display_name || id.username || id.email || null;
 }
 
+let slots = [];
+
+async function loadSlots() {
+  try {
+    slots = (await invoke("slots_list")) || [];
+  } catch (e) {
+    slots = [];
+  }
+}
+
 async function refresh() {
   state = await invoke("get_state");
   if (state?.language) init(state.language);
   await loadActivities();
+  await loadSlots();
+}
+
+let switchPop = null;
+
+function closeSwitchPop() {
+  if (switchPop) {
+    switchPop.remove();
+    switchPop = null;
+  }
+}
+
+function slotLabel(sl) {
+  return sl.account_name || t("m.slotLoggedOut");
+}
+
+// 切换气泡：列出正在运行的客户端，末尾常驻一个「多开」。
+async function openSwitchPop(accountId, ev) {
+  closeSwitchPop();
+  const acct = state?.accounts?.find((a) => a.id === accountId);
+  if (!acct) return;
+  await loadSlots();
+  const running = slots.filter((s) => s.running);
+  const btn =
+    ev?.currentTarget?.getBoundingClientRect
+      ? ev.currentTarget
+      : ev?.target?.closest?.("[click]");
+  const rect = btn?.getBoundingClientRect ? btn.getBoundingClientRect() : null;
+
+  const pop = document.createElement("div");
+  pop.className = "sw-pop";
+  const items = running.length
+    ? running
+        .map((s) => {
+          const tag = s.external
+            ? t("m.slotExternal")
+            : t("m.slotTag") + " " + s.app_name.replace("ZCodeSlot", "#");
+          return `<button class="sw-item" click="actions.switchToSlot('${accountId}','${s.id}')">
+            <span class="sw-name">${esc(slotLabel(s))}</span>
+            <span class="sw-tag">${esc(tag)}</span>
+          </button>`;
+        })
+        .join("")
+    : `<div class="sw-empty">${esc(t("m.slotNone"))}</div>`;
+
+  pop.innerHTML = `
+    <div class="sw-head">${esc(t("m.switchPopTitle", { name: acct.name }))}</div>
+    <div class="sw-list">${items}</div>
+    <div class="sw-sep"></div>
+    <button class="sw-item sw-multi" click="actions.multiOpen('${accountId}')" title="${esc(t("m.multiOpenHint"))}">
+      <span class="sw-plus">+</span><span class="sw-name">${esc(t("m.multiOpen"))}</span>
+    </button>
+  `;
+  // 先隐藏插入以便量尺寸，再按可用空间决定朝下还是朝上弹
+  pop.style.visibility = "hidden";
+  pop.style.left = "0px";
+  pop.style.top = "0px";
+  document.body.appendChild(pop);
+
+  const margin = 8;
+  const gap = 6;
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const w = pop.offsetWidth || 240;
+  const h = pop.offsetHeight || 160;
+
+  let left;
+  let top;
+  if (rect) {
+    left = Math.max(margin, Math.min(vw - w - margin, rect.right - w));
+    const spaceBelow = vh - rect.bottom - gap - margin;
+    const spaceAbove = rect.top - gap - margin;
+    // 下方放不下、且上方更宽裕 → 往上弹；否则往下
+    if (h > spaceBelow && spaceAbove > spaceBelow) {
+      top = rect.top - h - gap;
+    } else {
+      top = rect.bottom + gap;
+    }
+  } else {
+    left = (vw - w) / 2;
+    top = (vh - h) / 2;
+  }
+  left = Math.max(margin, Math.min(vw - w - margin, left));
+  top = Math.max(margin, Math.min(vh - h - margin, top));
+  pop.style.left = left + "px";
+  pop.style.top = top + "px";
+  pop.style.visibility = "";
+  switchPop = pop;
+  setTimeout(() => {
+    const onDoc = (e) => {
+      if (switchPop && !switchPop.contains(e.target)) {
+        closeSwitchPop();
+        document.removeEventListener("click", onDoc, true);
+      }
+    };
+    document.addEventListener("click", onDoc, true);
+  }, 0);
 }
 
 function uiLocked() {
@@ -222,6 +329,36 @@ const actions = {
       await invoke("delete_account", { id });
       toast(t("m.toastDeleted"));
       await refresh(); render();
+    });
+  },
+
+  openSwitch(id, ev) {
+    openSwitchPop(id, ev).catch((e) => toast(stripErr(e), "err"));
+  },
+
+  // 把账号登录到指定客户端（写凭据 + 重启那个客户端）
+  async switchToSlot(accountId, slotId) {
+    closeSwitchPop();
+    const a = state.accounts.find((x) => x.id === accountId);
+    await guard(async () => {
+      toast(t("m.slotAssigning", { name: a?.name || "" }));
+      await invoke("slot_assign", { id: slotId, accountId });
+      toast(t("m.slotAssigned", { name: a?.name || "" }), "ok");
+      await refresh();
+      render();
+    });
+  },
+
+  // 用当前账号多开一个独立客户端
+  async multiOpen(accountId) {
+    closeSwitchPop();
+    await guard(async () => {
+      toast(t("m.multiOpening"));
+      await invoke("slot_open", { accountId });
+      toast(t("m.multiOpened"), "ok");
+      setTimeout(() => {
+        refresh().then(render).catch(() => {});
+      }, 4000);
     });
   },
 
@@ -819,6 +956,17 @@ function render() {
     ? t("btn.refreshClaimOneTitle")
     : t("btn.refreshClaimCooldownTitle", { n: Math.ceil((refreshClaim.cooldownUntil - Date.now()) / 1000) });
 
+  // 已被某个运行中客户端占用的账号：切换按钮置灰（同一账号不能同时占两个客户端）
+  const occupiedBy = new Map();
+  for (const sl of slots) {
+    if (sl.running && sl.account_id) {
+      occupiedBy.set(
+        sl.account_id,
+        sl.external ? t("m.slotExternal") : t("m.slotTag") + " " + sl.app_name.replace("ZCodeSlot", "#"),
+      );
+    }
+  }
+
   const rows = s.accounts.map((a) => {
     const isActive = a.is_active;
     if (renaming === a.id) {      return `
@@ -858,8 +1006,9 @@ function render() {
           <button class="icon-btn" title="${t("btn.rename")}" aria-label="${t("btn.rename")}" click="actions.rename('${a.id}')">${ic("pen", 16)}</button>
           <button class="icon-btn" title="${t("btn.export")}" aria-label="${t("btn.export")}" click="actions.exportOne('${a.id}')">${ic("export", 16)}</button>
           <button class="icon-btn danger" title="${t("btn.delete")}" aria-label="${t("btn.delete")}" click="actions.delete('${a.id}')">${ic("x", 16)}</button>
-          <button class="btn-switch has-ic" click="actions.askSwitch('${a.id}')" ${isActive ? "disabled" : ""}>
-            ${isActive ? t("btn.current") : ic("swap", 14) + " " + t("btn.switch")}
+          <button class="btn-switch has-ic" click="actions.openSwitch('${a.id}', event)" ${occupiedBy.has(a.id) ? "disabled" : ""}
+            title="${occupiedBy.has(a.id) ? esc(t("btn.loggedInTitle", { where: occupiedBy.get(a.id) })) : ""}">
+            ${occupiedBy.has(a.id) ? t("btn.loggedIn") : ic("swap", 14) + " " + t("btn.switch")}
           </button>
         </div>
       </div>

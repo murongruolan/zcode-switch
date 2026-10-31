@@ -5,6 +5,47 @@
 
 ---
 
+## 多开客户端（本次）
+
+### 新增：切换气泡 + 多开
+
+点账号行的「切换」不再直接切号，而是弹出一层气泡：
+
+- 列出**所有正在运行的 ZCode 客户端**，各显示其登录的账号（没登录显示「未登录」）
+- 点某个客户端 = 把当前点选的账号登录到那个客户端
+- 气泡末尾**常驻**「多开一个客户端」，用当前账号新开一个独立客户端
+
+已被某个运行中客户端占用的账号，切换按钮置灰显示「已登录」，悬停提示占用者。
+
+### 原理
+
+不改 ZCode 的并发上限：每个客户端是独立的 app-server + agent 运行时，服务端下发的
+subagent 上限（实测 2）在各进程内分别计数。多开 = 让它们**各自拥有自己的槽**。
+
+隔离全部用 ZCode 官方支持的环境变量，不重打包、不改安装目录：
+
+```
+ZCODE_DESKTOP_APPLICATION_NAME     # 绕开单实例锁
+ZCODE_DESKTOP_USER_DATA_DIR        # userData 独立（Cookies 独立）
+ZCODE_DESKTOP_SESSION_DATA_DIR
+```
+
+同时传 `--user-data-dir=<槽目录>`，使按槽识别/关闭进程成为可能。
+
+### 新增文件
+
+- `src-tauri/src/slots.rs`：槽的定义、启动、按槽杀、账号指派、视图
+- 5 个命令：`slots_list` / `slot_open` / `slot_assign` / `slot_kill` / `slot_remove`
+- `docs/MULTI-INSTANCE.md`：完整机制说明、证据、注意事项
+
+### 修复
+
+- `store::no_window` / `store::detached` 提升为 `pub(crate)` 供新模块复用
+
+> 注意：顶部「关 ZCode」按钮仍是全杀，会关掉所有槽。
+
+---
+
 ## feat/activity-fallback-per-account-refresh · 基于上游 `v1.6.0`
 
 ### 修复：`billing/preview` 为空时被误判成「没有可领取」
