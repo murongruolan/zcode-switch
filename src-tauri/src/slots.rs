@@ -279,13 +279,15 @@ pub fn launch_slot(paths: &Paths, slot: &Slot) -> Result<(), String> {
     c.env("ZCODE_DESKTOP_USER_DATA_DIR", &slot.user_data_dir);
     c.env(
         "ZCODE_DESKTOP_SESSION_DATA_DIR",
-        format!("{}\\session", slot.user_data_dir),
+        PathBuf::from(&slot.user_data_dir)
+            .join("session")
+            .to_string_lossy()
+            .to_string(),
     );
-    if let Ok(home) = std::env::var("USERPROFILE") {
-        let slot_home = format!("{}\\home", slot.user_data_dir);
+    if std::env::var("USERPROFILE").is_ok() {
+        let slot_home = PathBuf::from(&slot.user_data_dir).join("home");
         let _ = fs::create_dir_all(&slot_home);
-        let _ = c.env("ZCODE_DESKTOP_HOME_DIR", slot_home);
-        let _ = home;
+        c.env("ZCODE_DESKTOP_HOME_DIR", slot_home);
     }
     store::detached(c)
         .spawn()

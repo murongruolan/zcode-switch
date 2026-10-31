@@ -31,7 +31,7 @@ pub(crate) fn detached(mut c: std::process::Command) -> std::process::Command {
     c
 }
 #[cfg(not(windows))]
-fn detached(mut c: std::process::Command) -> std::process::Command {
+pub(crate) fn detached(mut c: std::process::Command) -> std::process::Command {
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
     c.process_group(0);
