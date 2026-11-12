@@ -8,7 +8,15 @@
 //!   ZCODE_DESKTOP_APPLICATION_NAME   改 Electron userData → 绕开单实例锁
 //!   ZCODE_DESKTOP_USER_DATA_DIR      显式指定 userData（Cookies 独立）
 //!   ZCODE_DESKTOP_SESSION_DATA_DIR   会话数据目录
+//!   ZCODE_DATA_BASE_DIR              **把整个 `.zcode` 数据根搬进槽目录**（键）
+//!   ZCODE_TELEMETRY_DEVICE_MID       直接指定设备 mid（双保险）
 //!   --user-data-dir=<槽目录>          同时让「按槽关进程」可定位
+//!
+//! `ZCODE_DATA_BASE_DIR` 由 bundle 的 `getDataBaseDir()` 读取：
+//!   dataRoot = `$ZCODE_DATA_BASE_DIR/.zcode`，凭据 / telemetry-state / 会话库 / 日志
+//!   全在这棵树下。设了它，每个客户端就各有一份 credentials 与 deviceMid，
+//!   不再依赖「写全局文件 → 立刻 spawn」的抢读时序（那套在实测中会被下一个
+//!   客户端覆盖，导致两个客户端共用同一台「设备」）。
 //!
 //! 进程归属**用 PID 直管**，不去猜命令行：
 //!   spawn() 直接拿到 PID 存进 slots.json，存活判定 = 进程快照里有该 PID，
@@ -18,6 +26,7 @@
 //! 而它要求调用方已持有 `STORE_LOCK`（见 lib.rs 的 `store_guard()`）。
 
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -284,14 +293,73 @@ fn identity_match(li: &zcrypto::Identity, acc: &store::Account, paths: &Paths) -
 
 // ---------------------------------------------------------------- 启动 / 关闭
 
-/// 把槽需要的凭据和 device_mid 写成 live（ZCode 只在启动时读一次）。
+/// 槽自己的 ZCode 数据根。设了 `ZCODE_DATA_BASE_DIR=<user_data_dir>`，
+/// bundle 的 `getDataBaseDir()` 就会把 `.zcode` 挂到它下面。
+fn slot_zcode_root(slot: &Slot) -> PathBuf {
+    PathBuf::from(&slot.user_data_dir).join(".zcode")
+}
+
+/// 把凭据 / device_mid / 必要配置播种到槽自己的数据根。
+///
+/// 这是额度解耦的核心一步：每个客户端从此各有一份 `credentials.json` 与
+/// `telemetry-state.json`，不再靠「写全局文件 → 立刻 spawn」的抢读时序。
+/// 只补缺不覆盖（配置类文件）；凭据与 mid 每次启动都对齐当前绑定。
+fn seed_slot_data_root(
+    paths: &Paths,
+    slot: &Slot,
+    creds: Option<&Value>,
+    mid: &str,
+) -> Result<(), String> {
+    let v2 = slot_zcode_root(slot).join("v2");
+    fs::create_dir_all(&v2).map_err(|e| e.to_string())?;
+
+    if let Some(c) = creds {
+        let body = serde_json::to_string_pretty(c).unwrap_or_default() + "\n";
+        store::atomic_write(&v2.join("credentials.json"), &body)?;
+    }
+
+    // 这些是「客户端能正常起来」需要的静态配置，槽里没有就从全局拷一份。
+    for name in [
+        "provider_config.json",
+        "setting.json",
+        "onboarding-record.json",
+        "bot-config.v3.json",
+        "bot-state.v3.json",
+    ] {
+        let dst = v2.join(name);
+        if dst.exists() {
+            continue;
+        }
+        let src = paths.zcode_dir().join("v2").join(name);
+        if src.exists() {
+            let _ = fs::copy(&src, &dst);
+        }
+    }
+
+    let tele = v2.join("telemetry-state.json");
+    let mut v: Value = fs::read_to_string(&tele)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .filter(|x| x.is_object())
+        .unwrap_or_else(|| json!({}));
+    if v.get("deviceMid").and_then(|m| m.as_str()) != Some(mid) {
+        v["deviceMid"] = json!(mid);
+        store::atomic_write(&tele, &(serde_json::to_string(&v).unwrap_or_default() + "\n"))?;
+    }
+    Ok(())
+}
+
+/// 槽的凭据与 mid：既写全局 live（老版本 ZCode 没有 DATA_BASE_DIR 时兜底），
+/// 也播种到槽自己的数据根（3.17+ 真正生效的那份）。
 fn apply_credentials(paths: &Paths, slot: &mut Slot) -> Result<(), String> {
+    let mut creds: Option<Value> = None;
     if let Some(aid) = slot.account_id.clone() {
         let acc = store::load_account(paths, &aid)?;
         store::write_live(paths, &acc.credentials)?;
         if let Some(cfg) = &acc.config {
             let _ = store::write_live_config(paths, cfg);
         }
+        creds = Some(acc.credentials.clone());
     }
     let mid = match slot.device_mid.clone().filter(|m| !m.is_empty()) {
         Some(m) => m,
@@ -303,6 +371,7 @@ fn apply_credentials(paths: &Paths, slot: &mut Slot) -> Result<(), String> {
         }
     };
     store::write_live_device_mid(paths, &mid)?;
+    seed_slot_data_root(paths, slot, creds.as_ref(), &mid)?;
     Ok(())
 }
 
@@ -365,9 +434,16 @@ pub fn launch_slot(paths: &Paths, slot: &mut Slot) -> Result<u32, String> {
             .to_string(),
     );
     if std::env::var("USERPROFILE").is_ok() {
-        let slot_home = PathBuf::from(&slot.user_data_dir).join("home");
+        let slot_home = PathBuf::from(&slot.user_data_dir);
         let _ = fs::create_dir_all(&slot_home);
-        c.env("ZCODE_DESKTOP_HOME_DIR", slot_home);
+        // 桌面侧配置目录与数据根同源，避免 setting.json 又落回全局。
+        c.env("ZCODE_DESKTOP_HOME_DIR", &slot_home);
+        // 关键隔离：整个 .zcode 数据根（凭据 / telemetry / 会话库 / 日志）搬进槽目录。
+        c.env("ZCODE_DATA_BASE_DIR", &slot_home);
+        // 双保险：直接指定设备 mid，不依赖文件读取时机。
+        if let Some(mid) = slot.device_mid.clone().filter(|m| !m.is_empty()) {
+            c.env("ZCODE_TELEMETRY_DEVICE_MID", mid);
+        }
     }
 
     let child = store::detached(c)
@@ -391,18 +467,20 @@ pub fn launch_slot(paths: &Paths, slot: &mut Slot) -> Result<u32, String> {
     slot.pid = pid;
     slot.pid_started_at = started_at;
     slot.last_used_at = now_ts();
+    let isolated = slot_zcode_root(slot).join("v2").is_dir();
     flowlog::log(
         "slots",
         "launch",
         &format!(
-            "slot={} pid={} started={} settle={} wait={}ms acct={} mid={}",
+            "slot={} pid={} started={} settle={} wait={}ms acct={} mid={} isolated={}",
             slot.id,
             pid,
             started_at,
             level,
             waited,
             slot.account_id.as_deref().unwrap_or("-"),
-            slot.device_mid.as_deref().unwrap_or("-")
+            slot.device_mid.as_deref().unwrap_or("-"),
+            isolated
         ),
     );
     Ok(pid)
@@ -802,6 +880,46 @@ mod tests {
         assert_eq!(back[0].id, "7");
         assert_eq!(back[0].pid_started_at, 1234);
         assert_eq!(back[0].data_epoch, 1);
+    }
+
+    #[test]
+    fn slot_data_root_gets_own_credentials_and_mid() {
+        let paths = temp_paths("seed");
+        let mut slot = sample_slot("3");
+        let ud = paths.home.join("slot3");
+        fs::create_dir_all(&ud).unwrap();
+        slot.user_data_dir = ud.to_string_lossy().to_string();
+
+        // 全局只有一份 setting.json 可供播种
+        let global_v2 = paths.zcode_dir().join("v2");
+        fs::create_dir_all(&global_v2).unwrap();
+        fs::write(global_v2.join("setting.json"), "{\"a\":1}").unwrap();
+
+        let creds = json!({"oauth:zai:token": "t1"});
+        seed_slot_data_root(&paths, &slot, Some(&creds), "mid-1").unwrap();
+        let v2 = slot_zcode_root(&slot).join("v2");
+        assert!(fs::read_to_string(v2.join("credentials.json"))
+            .unwrap()
+            .contains("t1"));
+        assert!(fs::read_to_string(v2.join("telemetry-state.json"))
+            .unwrap()
+            .contains("mid-1"));
+        assert!(v2.join("setting.json").exists(), "静态配置应从全局播种");
+
+        // 二次播种：mid 与凭据跟着换，静态配置不被覆盖
+        fs::write(v2.join("setting.json"), "{\"a\":2}").unwrap();
+        let creds2 = json!({"oauth:zai:token": "t2"});
+        seed_slot_data_root(&paths, &slot, Some(&creds2), "mid-2").unwrap();
+        assert!(fs::read_to_string(v2.join("telemetry-state.json"))
+            .unwrap()
+            .contains("mid-2"));
+        assert!(fs::read_to_string(v2.join("credentials.json"))
+            .unwrap()
+            .contains("t2"));
+        assert_eq!(
+            fs::read_to_string(v2.join("setting.json")).unwrap(),
+            "{\"a\":2}"
+        );
     }
 
     #[test]

@@ -1,24 +1,29 @@
 # 多开（同一账号多客户端）机制说明
 
-更新时间：2026-11-13（对应 `slots.rs` v2 落盘 + 启动闸门改造）
+更新时间：2026-11-13（对应 `slots.rs` v2 落盘 + 启动闸门 + **`ZCODE_DATA_BASE_DIR` 数据根隔离**）
 适用范围：`zcode-switch-175w`（1.7.5-Z.EMAIL + 多开）
 
 ---
 
 ## 1. 为什么需要多开
 
-ZCode 服务端按**账号**计 subagent 并发（约 3 个），超额返回
+ZCode 服务端按**身份**计 subagent 并发（实测 3 个），超额返回
 `rate_limited / "user concurrency limit exceeded"`。
-一个账号在多个客户端里同时干活，只要它们被服务端认成**同一台设备**，就共享这 3 个名额。
+同一个账号在多个客户端里干活，只要它们被服务端认成**同一个身份**，就共享这 3 个名额。
 
-于是「多开」要同时做到两件事，缺一不可：
+于是「多开」要同时做到三件事，缺一不可：
 
 | 要隔离的东西 | 靠什么隔离 |
 |---|---|
 | 单实例锁 / userData | `ZCODE_DESKTOP_APPLICATION_NAME`、`--user-data-dir=<槽目录>` |
-| 设备身份（device_mid） | 每个客户端写不同的 `telemetry-state.json` 值 |
+| **`.zcode` 数据根（凭据 / telemetry / 会话库 / 日志）** | **`ZCODE_DATA_BASE_DIR=<槽目录>`** |
+| 设备身份（device_mid） | 播种到 `<槽目录>\.zcode\v2\telemetry-state.json`，并用 `ZCODE_TELEMETRY_DEVICE_MID` 双保险 |
 
-只隔离 userData、不隔离 device_mid，服务端仍会把它们合并成一台设备 —— 这是上一版踩过的坑。
+只隔离 userData、不隔离数据根，两个客户端读到的还是同一份 `credentials.json`
+与同一个 `telemetry-state.json` —— 服务端当然按同一个身份算额度，这是上一版踩过的坑。
+
+> 数据根的开关是 `getDataBaseDir()`：`显式设置 || env.ZCODE_DATA_BASE_DIR || HOME`，
+> 其下取 `<base>\.zcode`。`ZCODE_HOME` 实测**不生效**，不要用。
 
 ---
 
@@ -57,17 +62,24 @@ ZCode 服务端按**账号**计 subagent 并发（约 3 个），超额返回
 ## 3. 启动时到底做了什么
 
 1. 拿启动闸门（`slots::launch_guard()`）——所有启动动作串行，默认客户端也一样。
-2. 把该账号的凭据写进 live `~/.zcode/v2/credentials.json`，把该槽的 device_mid
-   写进 live `~/.zcode/v2/telemetry-state.json`（ZCode **只在启动时读一次**）。
-3. spawn 客户端，带 `--user-data-dir` 与四个 `ZCODE_DESKTOP_*` 环境变量。
+2. `apply_credentials()`：
+   - 把该账号凭据写进 live `~/.zcode/v2/credentials.json`（给「默认客户端」用的兜底）；
+   - **同时**把凭据与 `device_mid` 播种到 `<槽目录>\.zcode\v2\`（`credentials.json` / `telemetry-state.json`），
+     配置类文件（`provider_config.json` / `setting.json` / `onboarding-record.json` / `bot-*.json`）只补缺不覆盖。
+3. spawn 客户端，带 `--user-data-dir=<槽目录>` 与：
+   - `ZCODE_DESKTOP_APPLICATION_NAME`、`ZCODE_DESKTOP_USER_DATA_DIR`、`ZCODE_DESKTOP_SESSION_DATA_DIR`；
+   - `ZCODE_DESKTOP_HOME_DIR=<槽目录>`（桌面侧配置也落在同一棵树）；
+   - **`ZCODE_DATA_BASE_DIR=<槽目录>`**（一切数据根隔离的关键）；
+   - **`ZCODE_TELEMETRY_DEVICE_MID=<该槽 mid>`**（不依赖文件读取时机）。
 4. 等「落地」：轮询该槽 userData 下是否出现 `Preferences` / `Local State`
    且 mtime ≥ 启动时刻（100ms 一次，最多 6s）。拿到证据再放闸门。
    - `settle=userdata`：正常；
    - `settle=timeout`：6s 没等到，闸门照样放行，但值得查一下进程是否真起来了。
-5. 记录 PID / 创建时间 / `last_used_at`，写回 `slots.json`。
+5. 记录 PID / 创建时间 / `last_used_at`，写回 `slots.json`；
+   flowlog 记 `isolated=<槽目录>\.zcode\v2 是否为目录`，用来事后确认这一发到底走没走结构隔离。
 
-**为什么必须串行**：live 文件是全局单份，两个启动重叠时，后启动的 mid
-会覆盖前一个「还没读到」的值，两个客户端就变成同一台设备，额度重新串在一起。
+**为什么还要串行**：live 文件（默认客户端那份）仍是全局单份，两个启动重叠时后写的会覆盖前一个
+还没读到的值。槽客户端已经只读自己的数据根，所以串行主要是保护默认客户端 + 让 flowlog 可读。
 
 ---
 
@@ -106,7 +118,7 @@ macOS 上不展示多开相关入口（后端 `slots_capability()` 返回 false�
 | 现象 | 先看什么 |
 |---|---|
 | 多开点了没反应 | flowlog `slots` 流的 `launch` 行有没有 `pid=`；`--cli slots` 里该槽 `running` 是否 true |
-| 两个账号额度还是串 | 两个槽的 `device_mid` 是否不同；`launch` 行里的 `mid` 是否就是 `slots.json` 里的那个 |
+| 两个账号额度还是串 | 先看 flowlog `launch` 行有没有 `isolated=true`；再看两个槽各自 `\.zcode\v2\telemetry-state.json` 的 `deviceMid` 与 `credentials.json` 是否不同 |
 | 界面显示在跑但关不掉 | `--cli slots` 看 `pid_started_at` 是否匹配；PID 被复用时旧记录会被自愈清掉 |
 | 报「槽位上限 32」 | `--cli slots` 看记录数；多出来的是没清理的僵尸记录，跑一次 `slots-gc --secs 0` |
 | 新账号登录后还是旧账号 | 检查 `data_epoch` 是否 +1、`user_data_dir` 是否换成新目录 |
@@ -117,7 +129,10 @@ macOS 上不展示多开相关入口（后端 `slots_capability()` 返回 false�
 
 ## 7. 验证方法（额度是否真的解耦）
 
-1. 同一账号开两个客户端，各自跑 4 个 subagent 任务。
-2. 查 `~/.zcode/cli/db/db.sqlite` 的 `model_usage` 表：
-   期望每个客户端 3 个成功、1 个 `user concurrency limit exceeded`，合计 6 个成功。
-3. 若合计只有 3 个成功，说明两个客户端的 device_mid 相同 —— 回到第 6 节第一条。
+1. 用「多开」给两个不同账号各开一个客户端（各自的数据根不同）。
+2. 每个客户端在**同一分钟内**各发一个「用 4 个 subagent 并行」的任务。
+3. 查 `~/.zcode/cli/db/db.sqlite` 的 `model_usage` 表（`started_at` 是毫秒）：
+   - 期望每个客户端 3 个在跑、1 个 `user concurrency limit exceeded`，合计 ≥6 个并发；
+   - 若合计被封在 3，说明两端仍被当成同一身份 → 回第 6 节第二条，先核 `deviceMid` 与 `credentials.json` 是否各在各的槽目录。
+
+单端上限（实测，四次复现）：一个客户端一次发 4 个 subagent，必然 3 个成功、1 个被拒，重试即可成功。
