@@ -9,29 +9,31 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 #[cfg(windows)]
-fn no_window(prog: &str) -> std::process::Command {
+pub(crate) fn no_window(prog: &str) -> std::process::Command {
     use std::os::windows::process::CommandExt;
     let mut c = std::process::Command::new(prog);
     c.creation_flags(0x0800_0000);
     c
 }
 #[cfg(not(windows))]
-fn no_window(prog: &str) -> std::process::Command {
+pub(crate) fn no_window(prog: &str) -> std::process::Command {
     std::process::Command::new(prog)
 }
 
 #[cfg(windows)]
-fn detached(mut c: std::process::Command) -> std::process::Command {
+pub(crate) fn detached(mut c: std::process::Command) -> std::process::Command {
     use std::os::windows::process::CommandExt;
     c.creation_flags(0x0000_0008 | 0x0000_0200);
     c
 }
 #[cfg(not(windows))]
-fn detached(mut c: std::process::Command) -> std::process::Command {
+pub(crate) fn detached(mut c: std::process::Command) -> std::process::Command {
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
     c.process_group(0);
@@ -400,26 +402,241 @@ fn zcode_pids() -> Vec<u32> {
         .collect()
 }
 
-#[cfg(windows)]
-pub fn zcode_running() -> bool {
-    if in_sandbox() {
-        return false;
+/// 单个 ZCode 进程的采样结果。
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PidInfo {
+    pub pid: u32,
+    /// 进程创建时间（epoch ms）；0 = 没取到（降级采样）
+    pub started_ms: i64,
+}
+
+/// 一次采集得到的进程快照。所有「某个 ZCode 是否在跑」的判断都吃这一份，
+/// 避免界面上每个槽各起一次 tasklist。
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ProcSnapshot {
+    pub pids: Vec<PidInfo>,
+    /// 主进程（Electron 顶层进程），已排除渲染/GPU/node 子进程
+    pub mains: Vec<u32>,
+    /// true = 只拿到 pid，拿不到父子关系与启动时间
+    pub degraded: bool,
+}
+
+impl ProcSnapshot {
+    /// 存活判定：PID 在快照里，且启动时间对得上（容差 2s，防 PID 复用误判）。
+    pub(crate) fn alive(&self, pid: u32, started_ms: i64) -> bool {
+        if pid == 0 {
+            return false;
+        }
+        let Some(info) = self.pids.iter().find(|p| p.pid == pid) else {
+            return false;
+        };
+        if started_ms == 0 || info.started_ms == 0 {
+            return true; // 降级：只看 PID
+        }
+        (info.started_ms - started_ms).abs() <= PID_TIME_TOLERANCE_MS
     }
-    !zcode_pids().is_empty()
+
+    pub(crate) fn started_of(&self, pid: u32) -> i64 {
+        self.pids
+            .iter()
+            .find(|p| p.pid == pid)
+            .map(|p| p.started_ms)
+            .unwrap_or(0)
+    }
+}
+
+/// 快照缓存时长：界面刷新的粒度，比这更短的重复调用没有意义。
+const PROC_SNAP_TTL: Duration = Duration::from_millis(1000);
+/// 启动时间容差：同一进程两次采样之间 CreationDate 可能差几十毫秒。
+const PID_TIME_TOLERANCE_MS: i64 = 2000;
+
+static PROC_SNAP: Mutex<Option<(Instant, ProcSnapshot)>> = Mutex::new(None);
+/// 降级采样只记一次日志，避免 PowerShell 长期不可用时把日志刷爆。
+static PROC_SNAP_DEGRADED_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// 取进程快照。`force = true` 时绕过缓存 —— 关进程、启动前判断这类「要动手」的
+/// 场合必须用强制刷新，否则可能拿 1 秒前的旧快照做决定。
+pub(crate) fn proc_snapshot(force: bool) -> ProcSnapshot {
+    if in_sandbox() {
+        return ProcSnapshot::default();
+    }
+    if !force {
+        if let Ok(g) = PROC_SNAP.lock() {
+            if let Some((at, snap)) = g.as_ref() {
+                if at.elapsed() < PROC_SNAP_TTL {
+                    return snap.clone();
+                }
+            }
+        }
+    }
+    let snap = collect_proc_snapshot();
+    if snap.degraded && !PROC_SNAP_DEGRADED_LOGGED.swap(true, Ordering::Relaxed) {
+        crate::flowlog::log(
+            "slots",
+            "snapshot-degraded",
+            "CIM unavailable, tasklist only",
+        );
+    }
+    if let Ok(mut g) = PROC_SNAP.lock() {
+        *g = Some((Instant::now(), snap.clone()));
+    }
+    snap
+}
+
+/// 收集：一次 CIM 查询同时拿到 pid / 父进程 / 创建时间。
+/// 主进程 = 父进程不在 ZCode 集合里的那些 —— 比匹配命令行更可靠，也不依赖输出编码。
+#[cfg(windows)]
+fn collect_proc_snapshot() -> ProcSnapshot {
+    if let Some(s) = collect_proc_cim() {
+        return s;
+    }
+    // 降级：tasklist 只有 pid，判断不了主进程。宁可少报一条「外部实例」，也不误报。
+    let filter = format!("IMAGENAME eq {ZCODE_IMAGE}");
+    let Ok(o) = no_window("tasklist")
+        .args(["/FI", filter.as_str(), "/FO", "CSV", "/NH"])
+        .output()
+    else {
+        return ProcSnapshot {
+            degraded: true,
+            ..Default::default()
+        };
+    };
+    let pids: Vec<PidInfo> = String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .filter_map(|l| l.split("\",\"").nth(1))
+        .filter_map(|s| s.trim_matches('"').parse::<u32>().ok())
+        .map(|pid| PidInfo {
+            pid,
+            started_ms: 0,
+        })
+        .collect();
+    ProcSnapshot {
+        pids,
+        mains: Vec::new(),
+        degraded: true,
+    }
+}
+
+#[cfg(windows)]
+fn collect_proc_cim() -> Option<ProcSnapshot> {
+    let script = concat!(
+        "$ps = @(Get-CimInstance Win32_Process -Filter \"Name='ZCode.exe'\"); ",
+        "\"COUNT=$($ps.Count)\"; ",
+        "$ps | ForEach-Object { '{0}|{1}|{2}' -f $_.ProcessId, $_.ParentProcessId, ",
+        "([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds() }"
+    );
+    let out = no_window("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut expected: Option<usize> = None;
+    let mut pids: Vec<PidInfo> = Vec::new();
+    let mut links: Vec<(u32, u32)> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("COUNT=") {
+            expected = rest.trim().parse::<usize>().ok();
+            continue;
+        }
+        if line.is_empty() {
+            continue;
+        }
+        let mut it = line.split('|');
+        let (Some(p), Some(pp), Some(ms)) = (it.next(), it.next(), it.next()) else {
+            continue;
+        };
+        let (Ok(pid), Ok(ppid), Ok(started)) = (
+            p.trim().parse::<u32>(),
+            pp.trim().parse::<u32>(),
+            ms.trim().parse::<i64>(),
+        ) else {
+            continue;
+        };
+        pids.push(PidInfo {
+            pid,
+            started_ms: started,
+        });
+        links.push((pid, ppid));
+    }
+    // PowerShell 有输出但一行都解析不出来 → 当成采集失败，交给降级路径，
+    // 否则「ZCode 明明在跑」会被误判成没跑。
+    if let Some(n) = expected {
+        if n > 0 && pids.len() < n {
+            return None;
+        }
+    } else if pids.is_empty() {
+        return None;
+    }
+    let set: Vec<u32> = pids.iter().map(|p| p.pid).collect();
+    let mains = links
+        .iter()
+        .filter(|(_, pp)| !set.contains(pp))
+        .map(|(p, _)| *p)
+        .collect();
+    Some(ProcSnapshot {
+        pids,
+        mains,
+        degraded: false,
+    })
 }
 
 #[cfg(not(windows))]
-pub fn zcode_running() -> bool {
-    if in_sandbox() {
-        return false;
+fn collect_proc_snapshot() -> ProcSnapshot {
+    // ps 一次拿全表：pid / ppid / 命令名 / 已运行秒数
+    let out = no_window("ps")
+        .args(["-axo", "pid=,ppid=,comm=,etimes="])
+        .output();
+    let Ok(o) = out else {
+        return ProcSnapshot {
+            degraded: true,
+            ..Default::default()
+        };
+    };
+    let now = chrono::Local::now().timestamp_millis();
+    let mut pids: Vec<PidInfo> = Vec::new();
+    let mut links: Vec<(u32, u32)> = Vec::new();
+    for line in String::from_utf8_lossy(&o.stdout).lines() {
+        let mut it = line.split_whitespace();
+        let (Some(p), Some(pp), Some(comm), Some(et)) =
+            (it.next(), it.next(), it.next(), it.next())
+        else {
+            continue;
+        };
+        if !comm.to_ascii_lowercase().contains("zcode") {
+            continue;
+        }
+        let (Ok(pid), Ok(ppid), Ok(etimes)) = (
+            p.parse::<u32>(),
+            pp.parse::<u32>(),
+            et.parse::<i64>(),
+        ) else {
+            continue;
+        };
+        pids.push(PidInfo {
+            pid,
+            started_ms: now - etimes.saturating_mul(1000),
+        });
+        links.push((pid, ppid));
     }
-    ["zcode", "ZCode"].iter().any(|name| {
-        no_window("pgrep")
-            .args(["-x", name])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    })
+    let set: Vec<u32> = pids.iter().map(|p| p.pid).collect();
+    let mains = links
+        .iter()
+        .filter(|(_, pp)| !set.contains(pp))
+        .map(|(p, _)| *p)
+        .collect();
+    ProcSnapshot {
+        pids,
+        mains,
+        degraded: false,
+    }
+}
+
+pub fn zcode_running() -> bool {
+    !proc_snapshot(false).pids.is_empty()
 }
 
 /// 非 Windows 的优雅退出等待上限：SIGTERM 后给 ZCode 走正常退出链路（销毁托盘图标）的时间。

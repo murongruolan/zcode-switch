@@ -10,6 +10,7 @@ mod oauth;
 mod probe;
 mod quota;
 mod risk;
+mod slots;
 mod store;
 mod zcrypto;
 
@@ -25,7 +26,7 @@ use tauri_plugin_dialog::DialogExt;
 
 const TRAY_ID: &str = "main";
 
-static STORE_LOCK: Mutex<()> = Mutex::new(());
+pub(crate) static STORE_LOCK: Mutex<()> = Mutex::new(());
 
 /// 托盘 tooltip 上附加的「新活动」提示（None = 无提示）。
 /// Windows 便携版拿不到 Toast，悬停托盘图标看提示是最可靠的可见通道。
@@ -60,11 +61,43 @@ fn pending_guard() -> std::sync::MutexGuard<'static, Option<PendingClaim>> {
     }
 }
 
-fn store_guard() -> std::sync::MutexGuard<'static, ()> {
-    match STORE_LOCK.lock() {
+thread_local! {
+    /// 当前线程持有 STORE_LOCK 的层数。`std::sync::Mutex` 没有 `is_locked()`，
+    /// 用它给 `save_slots` 这类写入口做「必须在锁内调用」的断言。
+    static STORE_LOCK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) struct StoreGuard {
+    inner: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+impl Drop for StoreGuard {
+    fn drop(&mut self) {
+        self.inner.take(); // 先解锁，再减计数
+        STORE_LOCK_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// 取存储锁。**同线程可重入**：`std::sync::Mutex` 不可重入，而不少内部函数
+/// （例如 `store::ensure_virtual_device_mid`）自己也会取锁；在已持锁的路径里
+/// 再取一次就会线程自锁、整个存储写入面全部卡死（1.7.5 基线踩过的真问题）。
+/// 这里用线程局部层数记住「本线程已持有」，重入时不再加锁、只加层数。
+pub(crate) fn store_guard() -> StoreGuard {
+    if STORE_LOCK_DEPTH.with(|d| d.get()) > 0 {
+        STORE_LOCK_DEPTH.with(|d| d.set(d.get() + 1));
+        return StoreGuard { inner: None };
+    }
+    let g = match STORE_LOCK.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
-    }
+    };
+    STORE_LOCK_DEPTH.with(|d| d.set(1));
+    StoreGuard { inner: Some(g) }
+}
+
+/// 当前线程是否持有存储锁。给写入口做 debug 断言用。
+pub(crate) fn in_store_guard() -> bool {
+    STORE_LOCK_DEPTH.with(|d| d.get() > 0)
 }
 
 /// 在阻塞线程池里跑必须同步等待的工作（ureq 网络请求、进程操作等）。
@@ -1489,8 +1522,19 @@ fn open_captcha_window(app: &AppHandle, auto: bool) -> Result<(), String> {
 
 #[tauri::command]
 async fn kill_zcode(app: AppHandle) -> Result<(), String> {
-    let _guard = store_guard();
-    let r = if store::kill_zcode()? { Ok(()) } else { Err(i18n::tr("err.zcode.kill_timeout")) };
+    let r = run_blocking(|| {
+        let _guard = store_guard();
+        let paths = Paths::detect();
+        let ok = store::kill_zcode()?;
+        // 全杀之后所有槽的 PID 都失效，清干净避免下次读状态还显示「在跑」
+        slots::clear_all_pids(&paths);
+        if ok {
+            Ok(())
+        } else {
+            Err(i18n::tr("err.zcode.kill_timeout"))
+        }
+    })
+    .await;
     rebuild_tray(&app);
     r
 }
@@ -1781,14 +1825,115 @@ async fn set_zcode_path(app: AppHandle, path: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn launch_zcode(app: AppHandle) -> Result<(), String> {
-    let paths = Paths::detect();
-    let (p, ok) = effective_zcode_path(&paths);
-    if !ok {
-        return Err(i18n::trf("err.zcode.path_invalid_hint", &[("p", &p)]));
-    }
-    let r = store::launch_zcode(&p);
+    let r = run_blocking(|| {
+        let _guard = store_guard();
+        let paths = Paths::detect();
+        let (p, ok) = effective_zcode_path(&paths);
+        if !ok {
+            return Err(i18n::trf("err.zcode.path_invalid_hint", &[("p", &p)]));
+        }
+        // 与多开槽共用同一把启动闸门：两个启动重叠时会互相覆盖 live 文件
+        // （凭据 / device_mid），后启动的会污染先启动的那个客户端。
+        let _gate = slots::launch_guard();
+        // 默认实例用自己的固定 mid：否则它会和某个槽共用 live 值，
+        // 服务端把两个客户端算成同一台设备，subagent 额度就串了。
+        let mid = slots::ensure_default_mid(&paths);
+        let _ = write_live_device_mid(&paths, &mid);
+        // 记下它用的是哪个账号（之后 live 会被别的槽改写）
+        slots::record_default_slot(&paths);
+        store::launch_zcode(&p)
+    })
+    .await;
     rebuild_tray(&app);
     r
+}
+
+// ---- 多开槽 ----
+// 每个槽是一个独立的 ZCode 客户端（独立 userData + 独立 device_mid），
+// 各自持有自己账号的那份 subagent 并发额度。不改客户端任何上限。
+
+/// 当前平台是否支持多开。macOS 上没有对应的启动参数语义，界面不展示多开入口，
+/// 免得点了没反应。
+#[tauri::command]
+fn slots_capability() -> bool {
+    cfg!(windows)
+}
+
+#[tauri::command]
+async fn slots_list() -> Result<Vec<slots::SlotView>, String> {
+    run_blocking(|| {
+        let paths = Paths::detect();
+        // 读路径不写盘：真发现失效 PID 才持锁自愈，且自愈内部重新读盘再写，
+        // 避免用「读时」的旧快照覆盖别的写入。
+        let (views, has_dead) = slots::read_views(&paths);
+        if !has_dead {
+            return Ok(views);
+        }
+        {
+            let _guard = store_guard();
+            slots::heal_now(&paths)?;
+        }
+        Ok(slots::read_views(&paths).0)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn slot_open(account_id: Option<String>) -> Result<(), String> {
+    run_blocking(move || {
+        let _guard = store_guard();
+        let paths = Paths::detect();
+        let mut slot = slots::create_slot(&paths, account_id)?;
+        slots::launch_slot(&paths, &mut slot)?;
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn slot_assign(id: String, account_id: String) -> Result<(), String> {
+    run_blocking(move || {
+        let _guard = store_guard();
+        let paths = Paths::detect();
+        slots::assign(&paths, &id, &account_id).map(|_| ())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn slot_kill(app: AppHandle, id: String) -> Result<(), String> {
+    let ok = run_blocking(move || {
+        let _guard = store_guard();
+        let paths = Paths::detect();
+        slots::kill_slot(&paths, &id)
+    })
+    .await?;
+    rebuild_tray(&app);
+    if ok {
+        Ok(())
+    } else {
+        Err("槽进程未能在超时内退出".into())
+    }
+}
+
+#[tauri::command]
+async fn slot_remove(id: String) -> Result<(), String> {
+    run_blocking(move || {
+        let _guard = store_guard();
+        let paths = Paths::detect();
+        slots::remove_slot(&paths, &id)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn slots_gc(older_than_secs: i64) -> Result<usize, String> {
+    run_blocking(move || {
+        let _guard = store_guard();
+        let paths = Paths::detect();
+        slots::gc(&paths, older_than_secs)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1852,6 +1997,13 @@ pub fn run() {
             pick_zcode_path,
             set_zcode_path,
             launch_zcode,
+            slots_list,
+            slots_capability,
+            slot_open,
+            slot_assign,
+            slot_kill,
+            slot_remove,
+            slots_gc,
             open_external,
             open_settings,
             reveal_main,

@@ -158,6 +158,29 @@ pub fn run(args: &[String]) -> (String, i32) {
             Ok(false) => return (err(&crate::i18n::tr("err.zcode.kill_timeout")), 1),
             Err(e) => return (err(&e), 1),
         },
+        // 多开槽的只读视图：给脚本/排障用，行为和界面同一套判定
+        "slots" => {
+            let (views, has_dead) = crate::slots::read_views(&paths);
+            ok(json!({
+                "views": views,
+                "dead": has_dead,
+                "slots": crate::slots::load_slots(&paths),
+            }))
+        }
+        // 清理未运行的槽记录；--secs 0（默认）= 全部未运行
+        "slots-gc" => {
+            let secs = flag(rest, "--secs")
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(0);
+            let r = {
+                let _g = crate::store_guard();
+                crate::slots::gc(&paths, secs)
+            };
+            match r {
+                Ok(n) => ok(json!({ "removed": n })),
+                Err(e) => return (err(&e), 1),
+            }
+        }
         "quota" => {
             let res = match flag(rest, "--id") {
                 Some(id) => account_quota(&paths, &id),

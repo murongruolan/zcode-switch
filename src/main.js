@@ -297,16 +297,144 @@ function noteVersion(v) {
   }
 }
 
+let slots = [];
+// 当前平台是否支持多开（后端给结论，前端不自己猜平台）
+let slotsCap = false;
+
+async function loadSlots() {
+  if (!slotsCap) {
+    slots = [];
+    return;
+  }
+  try {
+    slots = (await invoke("slots_list")) || [];
+  } catch (e) {
+    slots = [];
+  }
+}
+
 async function refresh() {
   state = await invoke("get_state");
   if (state?.language) init(state.language);
+  slotsCap = await invoke("slots_capability").catch(() => false);
   loadVersionStatus();
   maybeStartProbe();
   startReminderTicker();
+  await loadSlots();
 }
 
 function uiLocked() {
   return renaming !== null;
+}
+
+// ---- 多开：切换气泡 ----
+
+let switchPop = null;
+
+function closeSwitchPop() {
+  if (switchPop) {
+    switchPop.remove();
+    switchPop = null;
+  }
+}
+
+function slotLabel(sl) {
+  return sl.account_name || t("m.slotLoggedOut");
+}
+
+// 气泡：列出正在运行的客户端 + 末尾常驻「多开」。
+async function openSwitchPop(accountId, ev) {
+  closeSwitchPop();
+  if (!slotsCap) return; // 平台不支持多开：入口本身也不该出现
+  const acct = state?.accounts?.find((a) => a.id === accountId);
+  if (!acct) return;
+  await loadSlots();
+  const running = slots.filter((s) => s.running);
+  const btn = ev?.currentTarget?.getBoundingClientRect
+    ? ev.currentTarget
+    : ev?.target?.closest?.("[click]");
+  const rect = btn?.getBoundingClientRect ? btn.getBoundingClientRect() : null;
+
+  const pop = document.createElement("div");
+  pop.className = "sw-pop";
+  const idle = slots.filter((s) => !s.running).length;
+  const items = running.length
+    ? running
+        .map((s) => {
+          const tag = s.external
+            ? t("m.slotExternal")
+            : t("m.slotTag") + " " + s.app_name.replace("ZCodeSlot", "#");
+          return `<div class="sw-row">
+            <button class="sw-item sw-pick" click="actions.switchToSlot('${accountId}','${s.id}')">
+              <span class="sw-name">${esc(slotLabel(s))}</span>
+              <span class="sw-tag">${esc(tag)}</span>
+            </button>
+            <button class="sw-x" click="actions.killSlot('${s.id}', event)"
+              title="${esc(t("m.slotKillTitle"))}" aria-label="${esc(t("m.slotKill"))}">${ic("x", 13)}</button>
+          </div>`;
+        })
+        .join("")
+    : `<div class="sw-empty">${esc(t("m.slotNone"))}</div>`;
+
+  const gcRow = idle > 0
+    ? `<div class="sw-sep"></div>
+    <button class="sw-item sw-gc" click="actions.gcSlots()" title="${esc(t("m.slotGcTitle"))}">
+      <span class="sw-plus">−</span><span class="sw-name">${esc(t("m.slotGc", { n: idle }))}</span>
+    </button>`
+    : "";
+
+  pop.innerHTML = `
+    <div class="sw-head">${esc(t("m.switchPopTitle", { name: acct.name }))}</div>
+    <div class="sw-list">${items}</div>
+    <div class="sw-sep"></div>
+    <button class="sw-item sw-multi" click="actions.multiOpen('${accountId}')" title="${esc(t("m.multiOpenHint"))}">
+      <span class="sw-plus">+</span><span class="sw-name">${esc(t("m.multiOpen"))}</span>
+    </button>
+    ${gcRow}
+  `;
+  // 先隐藏插入以便量尺寸，再按可用空间决定朝下还是朝上弹
+  pop.style.visibility = "hidden";
+  pop.style.left = "0px";
+  pop.style.top = "0px";
+  document.body.appendChild(pop);
+
+  const margin = 8;
+  const gap = 6;
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const w = pop.offsetWidth || 240;
+  const h = pop.offsetHeight || 160;
+
+  let left;
+  let top;
+  if (rect) {
+    left = Math.max(margin, Math.min(vw - w - margin, rect.right - w));
+    const spaceBelow = vh - rect.bottom - gap - margin;
+    const spaceAbove = rect.top - gap - margin;
+    if (h > spaceBelow && spaceAbove > spaceBelow) {
+      top = rect.top - h - gap;
+    } else {
+      top = rect.bottom + gap;
+    }
+  } else {
+    left = (vw - w) / 2;
+    top = (vh - h) / 2;
+  }
+  left = Math.max(margin, Math.min(vw - w - margin, left));
+  top = Math.max(margin, Math.min(vh - h - margin, top));
+  pop.style.left = left + "px";
+  pop.style.top = top + "px";
+  pop.style.visibility = "";
+  switchPop = pop;
+  setTimeout(() => {
+    const onDoc = (e) => {
+      if (switchPop && !switchPop.contains(e.target)) {
+        closeSwitchPop();
+        document.removeEventListener("click", onDoc, true);
+      }
+    };
+    document.addEventListener("click", onDoc, true);
+  }, 0);
 }
 
 async function guard(fn) {
@@ -511,6 +639,62 @@ const actions = {
       await invoke("delete_account", { id });
       toast(t("m.toastDeleted"));
       await refresh(); render();
+    });
+  },
+
+  // 点「切换」不再是直接切号，而是弹出气泡：选一个运行中的客户端登录进去，
+  // 或就地多开一个。已被占用的账号按钮是灰的，不会走到这里。
+  openSwitch(id, ev) {
+    openSwitchPop(id, ev).catch((e) => toast(stripErr(e), "err"));
+  },
+
+  // 把账号登录到指定客户端：写凭据 + 重启那个客户端
+  async switchToSlot(accountId, slotId) {
+    closeSwitchPop();
+    const a = state.accounts.find((x) => x.id === accountId);
+    await guard(async () => {
+      toast(t("m.slotAssigning", { name: a?.name || "" }));
+      await invoke("slot_assign", { id: slotId, accountId });
+      toast(t("m.slotAssigned", { name: a?.name || "" }), "ok");
+      await refresh();
+      render();
+    });
+  },
+
+  // 用当前账号多开一个独立客户端
+  async multiOpen(accountId) {
+    closeSwitchPop();
+    await guard(async () => {
+      toast(t("m.multiOpening"));
+      await invoke("slot_open", { accountId });
+      toast(t("m.multiOpened"), "ok");
+      setTimeout(() => {
+        refresh().then(render).catch(() => {});
+      }, 4000);
+    });
+  },
+
+  // 只关掉气泡里选中的那个客户端（不影响其它客户端）
+  async killSlot(slotId, ev) {
+    ev?.stopPropagation?.();
+    closeSwitchPop();
+    await guard(async () => {
+      toast(t("m.slotKilling"));
+      await invoke("slot_kill", { id: slotId });
+      toast(t("m.slotKilled"), "ok");
+      await refresh();
+      render();
+    });
+  },
+
+  // 清掉「已经关掉」的槽记录，编号才能被复用（不删磁盘上的 userData）
+  async gcSlots() {
+    closeSwitchPop();
+    await guard(async () => {
+      const n = await invoke("slots_gc", { olderThanSecs: 0 });
+      toast(t("m.slotGcDone", { n: n ?? 0 }), "ok");
+      await refresh();
+      render();
     });
   },
 
@@ -1883,6 +2067,17 @@ function renderInner() {
       ? unsaved ? t("m.status.unsaved") : t("m.status.safe")
       : t("m.status.loggedOut");
 
+  // 已被某个运行中客户端占用的账号：切换按钮置灰（同一账号不能同时占两个客户端）
+  const occupiedBy = new Map();
+  for (const sl of slots) {
+    if (sl.running && sl.account_id) {
+      occupiedBy.set(
+        sl.account_id,
+        sl.external ? t("m.slotExternal") : t("m.slotTag") + " " + sl.app_name.replace("ZCodeSlot", "#"),
+      );
+    }
+  }
+
   const rows = s.accounts.map((a) => {
     const isActive = a.is_active;
     if (renaming === a.id) {      return `
@@ -1913,6 +2108,17 @@ function renderInner() {
     const rowTitle = rowCd > 0 && !acctRefreshBusy[a.id]
       ? t("m.refreshCooldownSec", { n: rowCd })
       : t("btn.acctRefreshTitle");
+    // 切换按钮三态：在别的客户端里跑着 → 「已登录」（禁用）；当前账号且没在跑 → 「当前」；
+    // 其余 → 「切换」。mac 没有多开能力，整块不渲染。
+    const where = occupiedBy.get(a.id);
+    const swBtn = !slotsCap
+      ? ""
+      : where
+        ? `<button class="btn-switch" disabled title="${esc(t("btn.loggedInTitle", { where }))}">${t("btn.loggedIn")}</button>`
+        : `<button class="btn-switch has-ic" click="actions.openSwitch('${a.id}', event)"
+            title="${esc(isActive ? t("m.slotCurrentTitle") : t("btn.switch"))}">
+            ${ic("swap", 14)} ${isActive ? t("m.slotCurrent") : t("btn.switch")}
+          </button>`;
     return `
     <div class="row${isActive ? " active" : ""}" data-id="${a.id}">
       <div class="row-top">
@@ -1928,9 +2134,7 @@ function renderInner() {
           <button class="icon-btn" title="${t("btn.rename")}" aria-label="${t("btn.rename")}" click="actions.rename('${a.id}')">${ic("pen", 16)}</button>
           <button class="icon-btn" title="${t("btn.export")}" aria-label="${t("btn.export")}" click="actions.exportOne('${a.id}')">${ic("export", 16)}</button>
           <button class="icon-btn danger" title="${t("btn.delete")}" aria-label="${t("btn.delete")}" click="actions.delete('${a.id}')">${ic("x", 16)}</button>
-          <button class="btn-switch has-ic" click="actions.askSwitch('${a.id}')" ${isActive ? "disabled" : ""}>
-            ${isActive ? t("btn.current") : ic("swap", 14) + " " + t("btn.switch")}
-          </button>
+          ${swBtn}
         </div>
       </div>
       ${acctQuotaSlot(a.id)}
