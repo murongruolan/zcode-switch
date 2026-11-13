@@ -304,6 +304,45 @@ fn default_slot_account(paths: &Paths) -> Option<String> {
     v.get("account_id")?.as_str().map(|s| s.to_string())
 }
 
+// ---------------------------------------------------------------- mid 归属
+
+/// 默认实例（命令行里没有 `--user-data-dir` 的 ZCode 主进程）是否在跑。
+/// 它在跑的时候，**任何改写 live 根（凭据 / deviceMid）的动作都必须放弃**：
+/// 那等于把另一个账号的身份塞给一个活着的客户端，两个客户端会被服务端算成同一台设备。
+fn default_client_pid(snap: &store::ProcSnapshot) -> Option<u32> {
+    snap.mains
+        .iter()
+        .copied()
+        .find(|pid| snap.pids.iter().any(|p| p.pid == *pid && p.data_dir.is_empty()))
+}
+
+/// 给槽挑 mid：**避开当前已在跑的客户端（其他槽 + 默认实例）正在用的 mid**。
+/// 实测（2026-11-14，另一台机器）：默认实例在跑时给 neurs757 开槽，
+/// 槽又把 live 根的 deviceMid 写成了自己的，结果两个客户端上报同一个 mid，
+/// 服务端按「一台设备」计数，两边合计仍只有 4 个 subagent。
+/// `salt` 传入正在准备的槽 id 时，它自己的旧 mid 不参与冲突判定（允许原地复用）。
+fn pick_slot_mid(
+    paths: &Paths,
+    account_id: Option<&str>,
+    snap: &store::ProcSnapshot,
+    salt: Option<&str>,
+) -> String {
+    let slots = load_slots(paths);
+    let busy: Vec<String> = slots
+        .iter()
+        .filter(|s| s.running(snap))
+        .filter(|s| salt.map_or(true, |x| s.id != x))
+        .filter_map(|s| s.device_mid.clone())
+        .chain(live_mid(paths))
+        .collect();
+    let canonical = account_id.and_then(|aid| store::ensure_virtual_device_mid(paths, aid).ok());
+    match canonical {
+        Some(m) if !m.is_empty() && !busy.iter().any(|b| b.eq_ignore_ascii_case(&m)) => m,
+        _ => fresh_mid(paths, &slots),
+    }
+}
+
+
 fn identity_match(li: &zcrypto::Identity, acc: &store::Account, paths: &Paths) -> bool {
     let ai = zcrypto::account_identity(&acc.credentials, paths.home.as_path());
     (li.user_id.is_some() && li.user_id == ai.user_id)
@@ -373,11 +412,22 @@ fn seed_slot_data_root(
 /// 也播种到槽自己的数据根（3.17+ 真正生效的那份）。
 fn apply_credentials(paths: &Paths, slot: &mut Slot) -> Result<(), String> {
     let mut creds: Option<Value> = None;
+    // 默认实例在跑时不再改写 live 根：写凭据会让活着的客户端被当成另一个账号，
+    // 写 deviceMid 会让它与槽撞成同一台设备（实测 2026-11-14 另一台机器踩到）。
+    let live_busy = default_client_pid(&store::proc_snapshot(true)).is_some();
     if let Some(aid) = slot.account_id.clone() {
         let acc = store::load_account(paths, &aid)?;
-        store::write_live(paths, &acc.credentials)?;
-        if let Some(cfg) = &acc.config {
-            let _ = store::write_live_config(paths, cfg);
+        if !live_busy {
+            store::write_live(paths, &acc.credentials)?;
+            if let Some(cfg) = &acc.config {
+                let _ = store::write_live_config(paths, cfg);
+            }
+        } else {
+            flowlog::log(
+                "slots",
+                "skip-live-write",
+                &format!("slot={} default-client-running", slot.id),
+            );
         }
         creds = Some(acc.credentials.clone());
     }
@@ -390,9 +440,41 @@ fn apply_credentials(paths: &Paths, slot: &mut Slot) -> Result<(), String> {
             fresh
         }
     };
-    store::write_live_device_mid(paths, &mid)?;
+    // 槽的 deviceMid **绝不写进 live 根**：live 根是默认实例的地盘，
+    // 写进去会让之后手动启动的默认客户端顶着槽的 mid 上线（两个客户端撞成同一台设备，
+    // 实测 2026-11-14 另一台机器：real/slot 都是 neurs757 的 mid，合计只剩 4 个 subagent）。
+    // 槽自己的 mid 已经通过 ZCODE_DATA_BASE_DIR 播种 + ZCODE_TELEMETRY_DEVICE_MID 注入。
     seed_slot_data_root(paths, slot, creds.as_ref(), &mid)?;
     Ok(())
+}
+
+/// 修掉 live 根里的历史污染：live 的 deviceMid 若与某个槽相同，且默认实例当前没在跑，
+/// 就把它改回默认实例自己的 mid。默认实例在跑时不动（那是正在使用的身份，改了更糟）。
+pub fn heal_live_mid_collision(paths: &Paths) -> Option<(String, String)> {
+    let snap = store::proc_snapshot(true);
+    if default_client_pid(&snap).is_some() {
+        return None;
+    }
+    let live = live_mid(paths)?;
+    let slots = load_slots(paths);
+    if !slots.iter().any(|s| {
+        s.device_mid
+            .as_deref()
+            .map_or(false, |m| m.eq_ignore_ascii_case(&live))
+    }) {
+        return None;
+    }
+    let mid = ensure_default_mid(paths);
+    if mid.eq_ignore_ascii_case(&live) {
+        return None;
+    }
+    let _ = store::write_live_device_mid(paths, &mid);
+    flowlog::log(
+        "slots",
+        "heal-live-mid",
+        &format!("old={live} new={mid}"),
+    );
+    Some((live, mid))
 }
 
 /// 启动后的落地判定：等新进程在 userData 下写出启动痕迹，再放闸门。
@@ -449,6 +531,42 @@ pub fn launch_slot(paths: &Paths, slot: &mut Slot) -> Result<u32, String> {
     }
     // 从这里到 settle 结束，任何别的启动都不能插进来改写 live 文件。
     let _gate = launch_guard();
+    // mid 撞车就地纠正：与 live 根或其他在跑客户端的 mid 相同 → 换一个新的。
+    // 服务端按 device mid 认定「设备」，撞了就共享额度（实测 2026-11-14）。
+    let mut mid_fixed = false;
+    if let Some(cur) = slot.device_mid.clone().filter(|m| !m.is_empty()) {
+        let live = live_mid(paths);
+        let others = load_slots(paths);
+        let clash_live = live
+            .as_deref()
+            .map(|l| l.eq_ignore_ascii_case(&cur))
+            .unwrap_or(false)
+            && default_client_pid(&snap).is_some();
+        let clash_slot = others.iter().any(|s| {
+            s.id != slot.id
+                && s.running(&snap)
+                && s.device_mid
+                    .as_deref()
+                    .map(|m| m.eq_ignore_ascii_case(&cur))
+                    .unwrap_or(false)
+        });
+        if clash_live || clash_slot {
+            let fresh = fresh_mid(paths, &others);
+            flowlog::log(
+                "slots",
+                "mid-collision-fixed",
+                &format!(
+                    "slot={} old={} new={} live={}",
+                    slot.id,
+                    cur,
+                    fresh,
+                    clash_live
+                ),
+            );
+            slot.device_mid = Some(fresh);
+            mid_fixed = true;
+        }
+    }
     apply_credentials(paths, slot)?;
     let spawn_at = now_ms();
 
@@ -503,7 +621,7 @@ pub fn launch_slot(paths: &Paths, slot: &mut Slot) -> Result<u32, String> {
         "slots",
         "launch",
         &format!(
-            "slot={} pid={} started={} settle={} wait={}ms acct={} mid={} isolated={}",
+            "slot={} pid={} started={} settle={} wait={}ms acct={} mid={} liveMid={} liveRunning={} midFixed={} isolated={}",
             slot.id,
             pid,
             started_at,
@@ -511,6 +629,9 @@ pub fn launch_slot(paths: &Paths, slot: &mut Slot) -> Result<u32, String> {
             waited,
             slot.account_id.as_deref().unwrap_or("-"),
             slot.device_mid.as_deref().unwrap_or("-"),
+            live_mid(paths).unwrap_or_else(|| "-".to_string()),
+            default_client_pid(&snap).is_some(),
+            mid_fixed,
             isolated
         ),
     );
@@ -608,12 +729,7 @@ pub fn create_slot(paths: &Paths, account_id: Option<String>) -> Result<Slot, St
         let epoch = slots[i].data_epoch.saturating_add(1);
         let dir = slot_data_dir(paths, &id, epoch);
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let mid = match &account_id {
-            Some(aid) => store::ensure_virtual_device_mid(paths, aid)
-                .ok()
-                .unwrap_or_else(|| fresh_mid(paths, &slots)),
-            None => fresh_mid(paths, &slots),
-        };
+        let mid = pick_slot_mid(paths, account_id.as_deref(), &snap, None);
         slots[i].account_id = account_id;
         slots[i].device_mid = Some(mid);
         slots[i].pid = 0;
@@ -648,10 +764,7 @@ pub fn create_slot(paths: &Paths, account_id: Option<String>) -> Result<Slot, St
     let id = n.to_string();
     let dir = slot_data_dir(paths, &id, 0);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let device_mid = match &account_id {
-        Some(aid) => store::ensure_virtual_device_mid(paths, aid).ok(),
-        None => Some(fresh_mid(paths, &slots)),
-    };
+    let device_mid = Some(pick_slot_mid(paths, account_id.as_deref(), &snap, None));
     let slot = Slot {
         id: id.clone(),
         app_name: format!("ZCodeSlot{n}"),
@@ -955,9 +1068,65 @@ mod tests {
         assert!(!slot.running(&other));
     }
 
+    /// 默认实例 = 主进程命令行里没有 `--user-data-dir`。它跑着的时候绝不能改写 live 根。
     #[test]
-    fn legacy_array_is_loaded_without_losing_fields() {
-        let paths = temp_paths("legacy");
+    fn default_instance_detected_by_empty_data_dir() {
+        let snap = store::ProcSnapshot {
+            degraded: false,
+            mains: vec![1, 2],
+            pids: vec![
+                store::PidInfo {
+                    pid: 1,
+                    started_ms: 1,
+                    data_dir: String::new(),
+                },
+                store::PidInfo {
+                    pid: 2,
+                    started_ms: 1,
+                    data_dir: store::normalize_dir(r"C:\x\slot1"),
+                },
+            ],
+        };
+        assert_eq!(default_client_pid(&snap), Some(1), "空 data_dir 的主进程就是默认实例");
+        let only_slot = store::ProcSnapshot {
+            degraded: false,
+            mains: vec![2],
+            pids: vec![snap.pids[1].clone()],
+        };
+        assert_eq!(default_client_pid(&only_slot), None);
+    }
+
+    /// 撞车场景：live 根与在跑的槽用同一 mid（2026-11-14 另一台机器实测），
+    /// 重新分配时必须换一支新的，绝不能再落回已被占用的值。
+    #[test]
+    fn pick_slot_mid_avoids_live_and_running_slots() {
+        let paths = temp_paths("midpick");
+        let v2 = paths.data_root.join(".zcode").join("v2");
+        fs::create_dir_all(&v2).unwrap();
+        fs::write(v2.join("telemetry-state.json"), r#"{"deviceMid":"m1"}"#).unwrap();
+        let mut slot = sample_slot("1");
+        slot.device_mid = Some("m1".into());
+        {
+            let _g = crate::store_guard();
+            save_slots(&paths, &[slot]).unwrap();
+        }
+        let snap = store::ProcSnapshot {
+            degraded: false,
+            mains: vec![222],
+            pids: vec![store::PidInfo {
+                pid: 222,
+                started_ms: 900,
+                data_dir: store::normalize_dir(r"C:\X\slot1"),
+            }],
+        };
+        let picked = pick_slot_mid(&paths, None, &snap, None);
+        assert_ne!(picked, "m1", "不能复用 live / 在跑槽的 mid");
+        assert!(!picked.is_empty());
+        let _ = fs::remove_dir_all(&paths.home);
+    }
+
+    #[test]
+    fn legacy_array_is_loaded_without_losing_fields() {        let paths = temp_paths("legacy");
         fs::write(slots_file(&paths), LEGACY_JSON).unwrap();
         let slots = load_slots(&paths);
         assert_eq!(slots.len(), 2);

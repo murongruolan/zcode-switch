@@ -1912,6 +1912,9 @@ async fn launch_zcode(app: AppHandle) -> Result<(), String> {
         // 与多开槽共用同一把启动闸门：两个启动重叠时会互相覆盖 live 文件
         // （凭据 / device_mid），后启动的会污染先启动的那个客户端。
         let _gate = slots::launch_guard();
+        // 先修历史污染：live 的 deviceMid 若还是某个槽的值，改回默认实例自己的。
+        // （2026-11-14 另一台机器：默认客户端顶着槽的 mid 上线，两个客户端合计只剩 4 个）
+        let _ = slots::heal_live_mid_collision(&paths);
         // 默认实例用自己的固定 mid：否则它会和某个槽共用 live 值，
         // 服务端把两个客户端算成同一台设备，subagent 额度就串了。
         let mid = slots::ensure_default_mid(&paths);
@@ -2120,6 +2123,12 @@ pub fn run() {
                     }
                 });
             }
+            // 启动时修一次 live 根的历史 mid 污染：早期版本把槽的 deviceMid 写进了 live，
+            // 之后手动启动的默认客户端会顶着槽的身份上线，两个客户端被算成同一台设备。
+            // （默认实例正在跑时 heal 内部会跳过，不去改一个正在使用的身份）
+            std::thread::spawn(|| {
+                let _ = slots::heal_live_mid_collision(&Paths::detect());
+            });
             // 一次性诊断：`ZSWITCH_ONESHOT_CLAIM="<accountId>|<planId>"` 启动后自动对指定
             // plan_id 发起领取（走正常验证码窗口，traceless 通过即提交），结果落 flowlog。
             // 只由 `--claim-plan <planId> --id <accountId>` 这个命令行入口设置，正常启动不受影响。
