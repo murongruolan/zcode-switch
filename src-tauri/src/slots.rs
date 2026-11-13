@@ -110,6 +110,26 @@ fn now_ts() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
+impl Slot {
+    /// 这个槽的客户端是否还活着。
+    ///
+    /// 两道判据：记录的 PID 对得上（含创建时间容差）；或者**命令行里带着同一个
+    /// `--user-data-dir`** 的进程还在。后者是必须的 —— ZCode 首次启动/更新后会
+    /// 自己重新拉起主进程，PID 变了但数据目录没变，只认 PID 会把活着的槽判成死的，
+    /// 进而允许同一账号再开一个窗口（两个窗口同一个数据根 → 额度又串起来）。
+    pub fn running(&self, snap: &store::ProcSnapshot) -> bool {
+        snap.alive(self.pid, self.pid_started_at) || snap.by_dir(&self.user_data_dir).is_some()
+    }
+
+    /// 当前实际应该记的 PID：优先用按目录找回来的（客户端自重启后是新 PID）。
+    pub fn live_pid(&self, snap: &store::ProcSnapshot) -> Option<(u32, i64)> {
+        if self.pid != 0 && snap.alive(self.pid, self.pid_started_at) {
+            return Some((self.pid, self.pid_started_at));
+        }
+        snap.by_dir(&self.user_data_dir)
+    }
+}
+
 pub fn slots_file(paths: &Paths) -> PathBuf {
     paths.store_dir().join("slots.json")
 }
@@ -409,8 +429,19 @@ fn settle_after_spawn(slot: &Slot, spawn_at_ms: i64) -> (&'static str, u128) {
 
 /// 启动一个槽。已在运行则直接返回原 PID，不重复开。
 pub fn launch_slot(paths: &Paths, slot: &mut Slot) -> Result<u32, String> {
-    if store::proc_snapshot(true).alive(slot.pid, slot.pid_started_at) {
-        return Ok(slot.pid);
+    let snap = store::proc_snapshot(true);
+    if let Some((pid, started)) = slot.live_pid(&snap) {
+        // 已经在跑（可能 PID 变了）：把记录对齐后直接返回，绝不再开第二个窗口。
+        if slot.pid != pid || slot.pid_started_at != started {
+            slot.pid = pid;
+            slot.pid_started_at = started;
+            flowlog::log(
+                "slots",
+                "launch-skip",
+                &format!("slot={} pid={pid} already running", slot.id),
+            );
+        }
+        return Ok(pid);
     }
     let (zcode_path, ok) = store::effective_zcode_path(paths);
     if !ok || zcode_path.trim().is_empty() {
@@ -486,40 +517,63 @@ pub fn launch_slot(paths: &Paths, slot: &mut Slot) -> Result<u32, String> {
     Ok(pid)
 }
 
-/// 按 PID 关闭单个槽，不碰其他客户端。
+/// 关闭单个槽，不碰其他客户端。
+///
+/// 目标进程 = 记录里的 PID（若还对得上）+ 命令行里带同一个 `--user-data-dir` 的
+/// 全部进程。后者兜住「客户端自重启后 PID 变了」的情况，否则旧窗口关不掉。
 pub fn kill_slot(paths: &Paths, id: &str) -> Result<bool, String> {
     let mut slots = load_slots(paths);
     let Some(idx) = slots.iter().position(|s| s.id == id) else {
         return Ok(true);
     };
-    let pid = slots[idx].pid;
-    let mut still = false;
-    if pid != 0 && store::proc_snapshot(true).alive(pid, slots[idx].pid_started_at) {
-        flowlog::log("slots", "kill", &format!("slot={id} pid={pid}"));
-        #[cfg(windows)]
-        {
-            let _ = store::no_window("taskkill")
-                .args(["/PID", &pid.to_string(), "/T", "/F"])
-                .output();
+    let snap = store::proc_snapshot(true);
+    let dir = slots[idx].user_data_dir.clone();
+    let mut targets: Vec<u32> = Vec::new();
+    if let Some((pid, _)) = slots[idx].live_pid(&snap) {
+        if pid != 0 {
+            targets.push(pid);
         }
-        #[cfg(not(windows))]
-        {
-            let _ = store::no_window("kill").args(["-9", &pid.to_string()]).output();
+    }
+    for pid in snap.pids_by_dir(&dir) {
+        if !targets.contains(&pid) {
+            targets.push(pid);
+        }
+    }
+    let mut still = false;
+    if !targets.is_empty() {
+        flowlog::log("slots", "kill", &format!("slot={id} pids={targets:?}"));
+        for pid in &targets {
+            #[cfg(windows)]
+            {
+                let _ = store::no_window("taskkill")
+                    .args(["/PID", &pid.to_string(), "/T", "/F"])
+                    .output();
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = store::no_window("kill").args(["-9", &pid.to_string()]).output();
+            }
         }
         let deadline = Instant::now() + EXIT_TIMEOUT;
         while Instant::now() < deadline {
-            if !store::proc_snapshot(false).alive(pid, slots[idx].pid_started_at) {
+            let now = store::proc_snapshot(false);
+            let any_alive = targets.iter().any(|p| {
+                now.pids.iter().any(|i| i.pid == *p)
+            });
+            if !any_alive && now.by_dir(&dir).is_none() {
                 break;
             }
             std::thread::sleep(EXIT_POLL);
         }
-        still = store::proc_snapshot(true).alive(pid, slots[idx].pid_started_at);
+        let now = store::proc_snapshot(true);
+        still = now.by_dir(&dir).is_some()
+            || targets.iter().any(|p| now.pids.iter().any(|i| i.pid == *p));
     }
     slots[idx].pid = 0;
     slots[idx].pid_started_at = 0;
     save_slots(paths, &slots)?;
     if still {
-        flowlog::log("slots", "kill-timeout", &format!("slot={id} pid={pid}"));
+        flowlog::log("slots", "kill-timeout", &format!("slot={id} pids={targets:?}"));
     }
     Ok(!still)
 }
@@ -546,7 +600,7 @@ pub fn create_slot(paths: &Paths, account_id: Option<String>) -> Result<Slot, St
     let reusable = slots
         .iter()
         .enumerate()
-        .filter(|(_, s)| !snap.alive(s.pid, s.pid_started_at))
+        .filter(|(_, s)| !s.running(&snap))
         .min_by_key(|(_, s)| s.id.parse::<u32>().unwrap_or(u32::MAX))
         .map(|(i, _)| i);
     if let Some(i) = reusable {
@@ -585,10 +639,7 @@ pub fn create_slot(paths: &Paths, account_id: Option<String>) -> Result<Slot, St
         n += 1;
     }
     if n > MAX_SLOTS {
-        let running = slots
-            .iter()
-            .filter(|s| snap.alive(s.pid, s.pid_started_at))
-            .count();
+        let running = slots.iter().filter(|s| s.running(&snap)).count();
         return Err(format!(
             "槽位上限 {MAX_SLOTS} 个（当前 {} 条记录，{running} 个在跑），先关掉不用的客户端再开",
             slots.len()
@@ -645,7 +696,7 @@ pub fn assign(paths: &Paths, id: &str, account_id: &str) -> Result<Slot, String>
         &format!("slot={id} epoch={epoch} acct={account_id}"),
     );
 
-    if store::proc_snapshot(true).alive(slots[idx].pid, slots[idx].pid_started_at) {
+    if slots[idx].running(&store::proc_snapshot(true)) {
         kill_slot(paths, id)?;
     }
     let mut slot = load_slots(paths)
@@ -664,7 +715,7 @@ pub fn gc(paths: &Paths, older_than_secs: i64) -> Result<usize, String> {
     let now = now_ts();
     let before = slots.len();
     slots.retain(|s| {
-        if snap.alive(s.pid, s.pid_started_at) {
+        if s.running(&snap) {
             return true;
         }
         if older_than_secs <= 0 {
@@ -689,7 +740,7 @@ pub fn remove_slot(paths: &Paths, id: &str) -> Result<(), String> {
     let alive = slots
         .iter()
         .find(|s| s.id == id)
-        .map(|s| store::proc_snapshot(false).alive(s.pid, s.pid_started_at))
+        .map(|s| s.running(&store::proc_snapshot(false)))
         .unwrap_or(false);
     if alive {
         kill_slot(paths, id)?;
@@ -726,7 +777,7 @@ pub fn read_views(paths: &Paths) -> (Vec<SlotView>, bool) {
     let snap = store::proc_snapshot(false);
     let has_dead = slots
         .iter()
-        .any(|s| s.pid != 0 && !snap.alive(s.pid, s.pid_started_at));
+        .any(|s| s.pid != 0 && !s.running(&snap) || s.pid == 0 && s.running(&snap));
     (build_views(paths, &slots, &snap), has_dead)
 }
 
@@ -737,15 +788,30 @@ pub fn heal_now(paths: &Paths) -> Result<usize, String> {
     let snap = store::proc_snapshot(true);
     let mut fixed = 0;
     for s in slots.iter_mut() {
-        if s.pid != 0 && !snap.alive(s.pid, s.pid_started_at) {
-            flowlog::log(
-                "slots",
-                "heal",
-                &format!("slot={} pid={} started={}", s.id, s.pid, s.pid_started_at),
-            );
-            s.pid = 0;
-            s.pid_started_at = 0;
-            fixed += 1;
+        match s.live_pid(&snap) {
+            // 活着但 PID 变了（客户端自重启后重新拉起主进程）→ 把记录改到新 PID
+            Some((pid, started)) if pid != s.pid || started != s.pid_started_at => {
+                flowlog::log(
+                    "slots",
+                    "heal-pid",
+                    &format!("slot={} old={} new={pid}", s.id, s.pid),
+                );
+                s.pid = pid;
+                s.pid_started_at = started;
+                fixed += 1;
+            }
+            // 记录的 PID 没了，命令行里也找不到这个数据目录 → 真的关了
+            None if s.pid != 0 => {
+                flowlog::log(
+                    "slots",
+                    "heal",
+                    &format!("slot={} pid={} started={}", s.id, s.pid, s.pid_started_at),
+                );
+                s.pid = 0;
+                s.pid_started_at = 0;
+                fixed += 1;
+            }
+            _ => {}
         }
     }
     if fixed > 0 {
@@ -766,14 +832,18 @@ fn build_views(paths: &Paths, slots: &[Slot], snap: &store::ProcSnapshot) -> Vec
             user_data_dir: s.user_data_dir.clone(),
             account_id: s.account_id.clone(),
             account_name: s.account_id.as_ref().and_then(|a| name_of(a)),
-            running: s.pid != 0,
-            pid: s.pid,
+            running: s.running(snap),
+            pid: s.live_pid(snap).map(|(p, _)| p).unwrap_or(s.pid),
             external: false,
         })
         .collect();
 
     // 外部实例：主进程里扣掉所有槽占用的 PID，剩下的就是用户自己开的
-    let slot_pids: Vec<u32> = slots.iter().map(|s| s.pid).filter(|p| *p != 0).collect();
+    let slot_pids: Vec<u32> = slots
+        .iter()
+        .filter_map(|s| s.live_pid(snap).map(|(p, _)| p))
+        .filter(|p| *p != 0)
+        .collect();
     let external: Vec<u32> = snap
         .mains
         .iter()
@@ -847,6 +917,43 @@ mod tests {
       {"id":"1","app_name":"ZCodeSlot1","user_data_dir":"C:\\x\\slot1","account_id":"a1","device_mid":"m1","pid":0,"created_at":1},
       {"id":"2","app_name":"ZCodeSlot2","user_data_dir":"C:\\x\\slot2","account_id":null,"device_mid":"m2","pid":123,"created_at":2}
     ]"#;
+
+    /// 客户端自重启后 PID 变了，但命令行里的数据目录没变 —— 槽必须仍算「在跑」，
+    /// 否则会允许同一账号再开一个窗口，两个窗口共用一个数据根。
+    #[test]
+    fn slot_is_running_even_after_client_restart() {
+        let mut slot = sample_slot("1");
+        slot.pid = 111;
+        slot.pid_started_at = 500;
+        let snap = store::ProcSnapshot {
+            degraded: false,
+            mains: vec![222],
+            pids: vec![store::PidInfo {
+                pid: 222,
+                started_ms: 900,
+                data_dir: store::normalize_dir(r"C:\X\slot1"),
+            }],
+        };
+        assert!(slot.running(&snap), "旧 PID 已失效，但同目录进程还在");
+        assert_eq!(slot.live_pid(&snap), Some((222, 900)), "heal 应把记录改到新 PID");
+
+        // 进程彻底没了 → 不算在跑，live_pid 为空
+        let empty = store::ProcSnapshot::default();
+        assert!(!slot.running(&empty));
+        assert_eq!(slot.live_pid(&empty), None);
+
+        // 只有无关目录的进程 → 不能误判成在跑
+        let other = store::ProcSnapshot {
+            degraded: false,
+            mains: vec![333],
+            pids: vec![store::PidInfo {
+                pid: 333,
+                started_ms: 1,
+                data_dir: store::normalize_dir(r"C:\x\slot9"),
+            }],
+        };
+        assert!(!slot.running(&other));
+    }
 
     #[test]
     fn legacy_array_is_loaded_without_losing_fields() {

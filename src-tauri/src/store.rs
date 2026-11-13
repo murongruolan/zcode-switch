@@ -408,6 +408,8 @@ pub(crate) struct PidInfo {
     pub pid: u32,
     /// 进程创建时间（epoch ms）；0 = 没取到（降级采样）
     pub started_ms: i64,
+    /// 命令行里的 `--user-data-dir=`（小写、无引号）；空 = 命令行里没有
+    pub data_dir: String,
 }
 
 /// 一次采集得到的进程快照。所有「某个 ZCode 是否在跑」的判断都吃这一份，
@@ -443,7 +445,44 @@ impl ProcSnapshot {
             .map(|p| p.started_ms)
             .unwrap_or(0)
     }
+
+    /// 按 `--user-data-dir` 找进程：客户端自己重启（ZCode 首次启动 / 更新后
+    /// 会重新拉起主进程）时 PID 会变，但 user-data-dir 不变 —— 靠这条判断
+    /// 「这个槽是不是还活着」，比只看记录的 PID 可靠。
+    pub(crate) fn by_dir(&self, dir: &str) -> Option<(u32, i64)> {
+        let want = normalize_dir(dir);
+        if want.is_empty() {
+            return None;
+        }
+        self.pids
+            .iter()
+            .find(|p| !p.data_dir.is_empty() && p.data_dir == want)
+            .map(|p| (p.pid, p.started_ms))
+    }
+
+    /// 同一 user-data-dir 下的全部进程（含子进程），用于整体关闭。
+    pub(crate) fn pids_by_dir(&self, dir: &str) -> Vec<u32> {
+        let want = normalize_dir(dir);
+        if want.is_empty() {
+            return Vec::new();
+        }
+        self.pids
+            .iter()
+            .filter(|p| !p.data_dir.is_empty() && p.data_dir == want)
+            .map(|p| p.pid)
+            .collect()
+    }
 }
+
+/// 目录比较口径：小写、去首尾空白与结尾反斜杠（Windows 路径大小写不敏感）。
+pub(crate) fn normalize_dir(dir: &str) -> String {
+    dir.trim()
+        .trim_matches('"')
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
+}
+
+
 
 /// 快照缓存时长：界面刷新的粒度，比这更短的重复调用没有意义。
 const PROC_SNAP_TTL: Duration = Duration::from_millis(1000);
@@ -508,6 +547,7 @@ fn collect_proc_snapshot() -> ProcSnapshot {
         .map(|pid| PidInfo {
             pid,
             started_ms: 0,
+            data_dir: String::new(),
         })
         .collect();
     ProcSnapshot {
@@ -522,8 +562,11 @@ fn collect_proc_cim() -> Option<ProcSnapshot> {
     let script = concat!(
         "$ps = @(Get-CimInstance Win32_Process -Filter \"Name='ZCode.exe'\"); ",
         "\"COUNT=$($ps.Count)\"; ",
-        "$ps | ForEach-Object { '{0}|{1}|{2}' -f $_.ProcessId, $_.ParentProcessId, ",
-        "([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds() }"
+        "$ps | ForEach-Object { $ud = ''; ",
+        "if ($_.CommandLine -match '--user-data-dir=(?:\\\"([^\\\"]+)\\\"|([^\\s]+))') { ",
+        "$ud = if ($matches[1]) { $matches[1] } else { $matches[2] } }; ",
+        "'{0}|{1}|{2}|{3}' -f $_.ProcessId, $_.ParentProcessId, ",
+        "([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds(), $ud }"
     );
     let out = no_window("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
@@ -556,9 +599,11 @@ fn collect_proc_cim() -> Option<ProcSnapshot> {
         ) else {
             continue;
         };
+        let data_dir = it.next().map(normalize_dir).unwrap_or_default();
         pids.push(PidInfo {
             pid,
             started_ms: started,
+            data_dir,
         });
         links.push((pid, ppid));
     }
@@ -619,6 +664,7 @@ fn collect_proc_snapshot() -> ProcSnapshot {
         pids.push(PidInfo {
             pid,
             started_ms: now - etimes.saturating_mul(1000),
+            data_dir: String::new(),
         });
         links.push((pid, ppid));
     }
@@ -1987,5 +2033,32 @@ mod tests {
             "无 userId 的老记录不得被其他账号命中"
         );
         let _ = fs::remove_dir_all(&paths.home);
+    }
+
+    /// 快照按命令行里的数据目录定位槽：PID 变了也要认出来。
+    #[test]
+    fn snapshot_locates_slot_by_data_dir() {
+        let snap = ProcSnapshot {
+            degraded: false,
+            mains: vec![77],
+            pids: vec![
+                PidInfo {
+                    pid: 77,
+                    started_ms: 1000,
+                    data_dir: normalize_dir(r"C:\X\slot1"),
+                },
+                PidInfo {
+                    pid: 78,
+                    started_ms: 2000,
+                    data_dir: normalize_dir(r"C:\X\slot1"),
+                },
+            ],
+        };
+        assert_eq!(snap.by_dir(r"C:\x\slot1"), Some((77, 1000)));
+        assert_eq!(snap.by_dir(r"c:\x\slot1\"), Some((77, 1000)));
+        assert_eq!(snap.pids_by_dir(r"C:\x\slot1"), vec![77, 78]);
+        assert!(snap.by_dir(r"C:\x\slot2").is_none());
+        // 空目录不得命中任何进程，否则所有槽都会被当成「在跑」
+        assert!(snap.by_dir("").is_none());
     }
 }
