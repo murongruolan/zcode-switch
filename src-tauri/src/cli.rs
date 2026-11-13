@@ -167,6 +167,33 @@ pub fn run(args: &[String]) -> (String, i32) {
                 "slots": crate::slots::load_slots(&paths),
             }))
         }
+        // 只重启一个槽（白屏自救）：--id <槽号>
+        "slots-restart" => {            let Some(id) = flag(rest, "--id") else {
+                return (err("缺少 --id <槽号>"), 1);
+            };
+            let r = {
+                let _g = crate::store_guard();
+                crate::slots::restart_slot(&paths, &id)
+            };
+            match r {
+                Ok(pid) => ok(json!({ "id": id, "pid": pid })),
+                Err(e) => return (err(&e), 1),
+            }
+        }
+        // 只关一个槽（不影响别的客户端）：--id <槽号>
+        "slots-kill" => {
+            let Some(id) = flag(rest, "--id") else {
+                return (err("缺少 --id <槽号>"), 1);
+            };
+            let r = {
+                let _g = crate::store_guard();
+                crate::slots::kill_slot(&paths, &id)
+            };
+            match r {
+                Ok(closed) => ok(json!({ "id": id, "closed": closed })),
+                Err(e) => return (err(&e), 1),
+            }
+        }
         // 清理未运行的槽记录；--secs 0（默认）= 全部未运行
         "slots-gc" => {
             let secs = flag(rest, "--secs")

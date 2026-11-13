@@ -372,6 +372,8 @@ async function openSwitchPop(accountId, ev) {
               <span class="sw-name">${esc(slotLabel(s))}</span>
               <span class="sw-tag">${esc(tag)}</span>
             </button>
+            <button class="sw-x" click="actions.restartSlot('${s.id}', event)"
+              title="${esc(t("m.slotRestartTitle"))}" aria-label="${esc(t("m.slotRestart"))}">${ic("refresh", 13)}</button>
             <button class="sw-x" click="actions.killSlot('${s.id}', event)"
               title="${esc(t("m.slotKillTitle"))}" aria-label="${esc(t("m.slotKill"))}">${ic("x", 13)}</button>
           </div>`;
@@ -671,6 +673,33 @@ const actions = {
       toast(t("m.multiOpening"));
       await invoke("slot_open", { accountId });
       toast(t("m.multiOpened"), "ok");
+      setTimeout(() => {
+        refresh().then(render).catch(() => {});
+      }, 4000);
+    });
+  },
+
+  // 白屏自救：只重启这一个客户端（同一槽、同一数据根），历史会话不丢，
+  // 正在生成的那一轮会被中断，所以先弹确认。
+  restartSlot(slotId, ev) {
+    ev?.stopPropagation?.();
+    closeSwitchPop();
+    const s = slots.find((x) => x.id === slotId);
+    openConfirmModal({
+      kind: "warn",
+      icon: "refresh",
+      title: t("m.slotRestartConfirmTitle"),
+      desc: `<span class="warn-line">${esc(t("m.slotRestartConfirmDesc", { name: s ? slotLabel(s) : "" }))}</span>`,
+      yesLabel: t("m.slotRestartYes"),
+      onYes: () => actions.doRestartSlot(slotId),
+    });
+  },
+
+  async doRestartSlot(slotId) {
+    await guard(async () => {
+      toast(t("m.slotRestarting"));
+      await invoke("slot_restart", { id: slotId });
+      toast(t("m.slotRestarted"), "ok");
       setTimeout(() => {
         refresh().then(render).catch(() => {});
       }, 4000);

@@ -29,7 +29,11 @@ pub(crate) fn no_window(prog: &str) -> std::process::Command {
 #[cfg(windows)]
 pub(crate) fn detached(mut c: std::process::Command) -> std::process::Command {
     use std::os::windows::process::CommandExt;
+    use std::process::Stdio;
     c.creation_flags(0x0000_0008 | 0x0000_0200);
+    // 不继承父进程的标准流：否则从 `--cli` 里启动客户端时，子进程的 stdout 会一直挂在
+    // 我们的输出管道上，命令行要等客户端退出才回得来（2026-11-14 实测卡住）。
+    c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     c
 }
 #[cfg(not(windows))]

@@ -1997,6 +1997,18 @@ async fn slot_kill(app: AppHandle, id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn slot_restart(app: AppHandle, id: String) -> Result<u32, String> {
+    let pid = run_blocking(move || {
+        let _guard = store_guard();
+        let paths = Paths::detect();
+        slots::restart_slot(&paths, &id)
+    })
+    .await?;
+    rebuild_tray(&app);
+    Ok(pid)
+}
+
+#[tauri::command]
 async fn slot_remove(id: String) -> Result<(), String> {
     run_blocking(move || {
         let _guard = store_guard();
@@ -2082,6 +2094,7 @@ pub fn run() {
             slot_open,
             slot_assign,
             slot_kill,
+            slot_restart,
             slot_remove,
             slots_gc,
             open_external,

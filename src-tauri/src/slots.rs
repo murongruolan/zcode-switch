@@ -643,6 +643,95 @@ pub fn launch_slot(paths: &Paths, slot: &mut Slot) -> Result<u32, String> {
 ///
 /// 目标进程 = 记录里的 PID（若还对得上）+ 命令行里带同一个 `--user-data-dir` 的
 /// 全部进程。后者兜住「客户端自重启后 PID 变了」的情况，否则旧窗口关不掉。
+/// 只重启**一个**槽：先温柔关窗（不发 /F，让客户端自己把会话写盘），
+/// 关不掉再强杀这一棵进程树（`/T` 只含它的子进程，碰不到别的实例和默认客户端），
+/// 最后用**同一个槽、同一个数据根**重新拉起 —— 历史会话在原数据根里，账号不会被换掉。
+///
+/// 用于「某个客户端白屏但别的窗口还在跑」：白屏是 ZCode 渲染进程崩了（GPU 子进程先崩），
+/// ZCode 自己也会重开，但可能等十几秒到几分钟；这里让用户可以立刻把它单独重启。
+/// 代价：该窗口**正在生成**的那一轮会中断（已落盘的消息不会丢）。
+pub fn restart_slot(paths: &Paths, id: &str) -> Result<u32, String> {
+    let mut slots = load_slots(paths);
+    let Some(idx) = slots.iter().position(|s| s.id == id) else {
+        return Err(format!("槽 {id} 不存在"));
+    };
+    let dir = slots[idx].user_data_dir.clone();
+    let snap = store::proc_snapshot(true);
+    let mut targets: Vec<u32> = Vec::new();
+    if let Some((pid, _)) = slots[idx].live_pid(&snap) {
+        if pid != 0 {
+            targets.push(pid);
+        }
+    }
+    for pid in snap.pids_by_dir(&dir) {
+        if !targets.contains(&pid) {
+            targets.push(pid);
+        }
+    }
+
+    if !targets.is_empty() {
+        flowlog::log("slots", "restart-kill", &format!("slot={id} pids={targets:?}"));
+        // 第一步：只发 WM_CLOSE（不带 /F），GUI 客户端收到关闭请求会先 flush
+        #[cfg(windows)]
+        for pid in &targets {
+            let _ = store::no_window("taskkill")
+                .args(["/PID", &pid.to_string()])
+                .output();
+        }
+        #[cfg(not(windows))]
+        for pid in &targets {
+            let _ = store::no_window("kill")
+                .args(["-TERM", &pid.to_string()])
+                .output();
+        }
+        let soft = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < soft {
+            if store::proc_snapshot(false).by_dir(&dir).is_none() {
+                break;
+            }
+            std::thread::sleep(EXIT_POLL);
+        }
+        // 第二步：赖着不走就强杀这棵树（/T 只带它的子进程）
+        if store::proc_snapshot(true).by_dir(&dir).is_some() {
+            flowlog::log("slots", "restart-force", &format!("slot={id} pids={targets:?}"));
+            #[cfg(windows)]
+            for pid in &targets {
+                let _ = store::no_window("taskkill")
+                    .args(["/PID", &pid.to_string(), "/T", "/F"])
+                    .output();
+            }
+            #[cfg(not(windows))]
+            for pid in &targets {
+                let _ = store::no_window("kill")
+                    .args(["-9", &pid.to_string()])
+                    .output();
+            }
+            let hard = Instant::now() + EXIT_TIMEOUT;
+            while Instant::now() < hard {
+                if store::proc_snapshot(false).by_dir(&dir).is_none() {
+                    break;
+                }
+                std::thread::sleep(EXIT_POLL);
+            }
+        }
+        if store::proc_snapshot(true).by_dir(&dir).is_some() {
+            return Err("该客户端没能在超时内退出，重启已取消（没有重新拉起）".into());
+        }
+    }
+
+    slots[idx].pid = 0;
+    slots[idx].pid_started_at = 0;
+    save_slots(paths, &slots)?;
+    let mut slot = slots[idx].clone();
+    let new_pid = launch_slot(paths, &mut slot)?;
+    flowlog::log(
+        "slots",
+        "restart",
+        &format!("slot={id} old={targets:?} new={new_pid}"),
+    );
+    Ok(new_pid)
+}
+
 pub fn kill_slot(paths: &Paths, id: &str) -> Result<bool, String> {
     let mut slots = load_slots(paths);
     let Some(idx) = slots.iter().position(|s| s.id == id) else {
