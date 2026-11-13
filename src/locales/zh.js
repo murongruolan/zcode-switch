@@ -122,6 +122,7 @@ export const zh = {
   "act.diagClaimedElsewhere": "在官方 ZCode 客户端领取的活动，本工具无法同步领取记录",
   "act.diagWindow": "活动通常每天 19:00（北京时间）后放量；当前可能尚未投放",
   "act.diagEmptyChannels": "服务端本次返回空（preview 与 marketing 均无数据）",
+  "act.diagIpThrottle": "若本账号确认尚未领取，多半是该网络出口的本次投放已用完或被限流：换一个网络环境（如手机热点）再刷新",
   "act.diagPreviewError": "套餐通道异常：{err}",
   "act.openDetail": "点击查看活动详情",
   "act.tipShort": "新活动：{title}",

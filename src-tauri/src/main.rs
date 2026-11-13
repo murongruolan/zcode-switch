@@ -49,5 +49,22 @@ fn main() {
         let _ = stdout.flush();
         std::process::exit(code);
     }
+    // GUI 模式一次性领取：`--claim-plan <planId> --id <accountId>`
+    // 启动后自动打开验证码窗口对该 plan_id 发起领取（正常窗口路径不受影响）。
+    if let Some(plan) = flag_value(&args, "--claim-plan") {
+        if let Some(id) = flag_value(&args, "--id") {
+            std::env::set_var("ZSWITCH_ONESHOT_CLAIM", format!("{}|{}", id, plan));
+        }
+    }
     zcode_switch_lib::run()
+}
+
+fn flag_value(args: &[String], name: &str) -> Option<String> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == name {
+            return it.next().cloned();
+        }
+    }
+    None
 }

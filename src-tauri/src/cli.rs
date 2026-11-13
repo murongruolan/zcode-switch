@@ -278,13 +278,15 @@ pub fn run(args: &[String]) -> (String, i32) {
                 );
             }
             if want("marketing") {
+                let seq = flag(rest, "--seq").and_then(|s| s.trim().parse::<u64>().ok());
                 out.insert(
                     "marketing".into(),
-                    pick(crate::claim::raw_marketing(
+                    pick(crate::claim::raw_marketing_with_seq(
                         &paths.home,
                         &acc.credentials,
                         acc.config.as_ref(),
                         Some(mid.clone()),
+                        seq,
                     )),
                 );
             }
@@ -348,6 +350,47 @@ pub fn run(args: &[String]) -> (String, i32) {
                 })),
                 Err(e) => return (err(&e), 1),
             }
+        }
+        // 诊断用：对指定 plan_id 原样发起领取并打印上游响应（验证「跨账号复用 plan_id」）。
+        // 不带 --captcha 时不发人机校验头，用来观察服务端是否直接拒绝。
+        "claim-try" => {
+            let (Some(id), Some(plan)) = (flag(rest, "--id"), flag(rest, "--plan")) else {
+                return (err("--id and --plan required"), 2);
+            };
+            let acc = match load_account(&paths, &id) {
+                Ok(a) => a,
+                Err(e) => return (err(&e), 1),
+            };
+            let mid = match ensure_virtual_device_mid(&paths, &id) {
+                Ok(m) => m,
+                Err(e) => return (err(&e), 1),
+            };
+            let captcha = flag(rest, "--captcha");
+            let region = flag(rest, "--region");
+            let resp = crate::claim::submit_claim_raw(
+                &paths.home,
+                &acc.credentials,
+                acc.config.as_ref(),
+                plan.trim(),
+                captcha.as_deref(),
+                region.as_deref(),
+                Some(mid),
+            );
+            let summary = format!(
+                "try acct={} plan={} http={} code={} msg={}",
+                acc.id,
+                plan.trim(),
+                resp.get("httpStatus").map(|v| v.to_string()).unwrap_or("-".into()),
+                resp.pointer("/body/code").map(|v| v.to_string()).unwrap_or("-".into()),
+                resp.pointer("/body/msg").and_then(|v| v.as_str()).unwrap_or("-"),
+            );
+            crate::flowlog::log("claim", "try", &summary);
+            ok(json!({
+                "id": acc.id,
+                "name": acc.name,
+                "planId": plan.trim(),
+                "resp": resp,
+            }))
         }
         // 诊断导出：打印脱敏 JSON（版本 / 通道状态 / 刷新摘要），用户可直接复制发送。
         "diag" => {

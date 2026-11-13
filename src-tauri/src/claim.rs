@@ -28,8 +28,21 @@ pub(crate) fn billing_claim_url() -> String {
 pub(crate) fn client_configs_url() -> String {
     format!("{}/api/v1/client/configs", api_base())
 }
+/// `marketing/touch` 的 `seq`：官方客户端每次请求都自增（bundle 里 `Xde++`，从 0 起）。
+/// 我们以前固定发 `0`，与官方行为不一致；这里照官方口径做「进程内从 0 递增」。
+static MARKETING_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_marketing_seq() -> u64 {
+    MARKETING_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 pub(crate) fn marketing_touch_url() -> String {
-    format!("{}/api/v1/marketing/touch?seq=0", api_base())
+    marketing_touch_url_with_seq(next_marketing_seq())
+}
+
+/// 指定 seq 的版本：诊断时用来对比「不同 seq 下服务端返回是否不同」。
+pub(crate) fn marketing_touch_url_with_seq(seq: u64) -> String {
+    format!("{}/api/v1/marketing/touch?seq={seq}", api_base())
 }
 
 const CLAIM_TIMEOUT_SECS: u64 = 25;
@@ -122,10 +135,17 @@ impl ClaimError {
     pub fn is_challenge(&self) -> bool {
         self.code == CLAIM_ERR_CHALLENGE
     }
+    /// 3012：unusual activity 风控拦截（账号或网络环境）。区别于 1003（已领）与 3007（缺校验头）。
+    /// 实测（2026-11-13）：同一账号同一请求，旧出口 IP 拦 3012，换干净 IP 直接领成功 → 归因优先给网络环境。
+    pub fn is_risk_blocked(&self) -> bool {
+        self.code == CLAIM_ERR_RISK_BLOCKED
+    }
 }
 
 /// 非 claim 业务码的保留语义码：HTTP 401/403 携带验证码挑战特征。
 pub const CLAIM_ERR_CHALLENGE: i64 = -2;
+/// 上游风控拦截码（unusual activity）：账号或网络环境异常。
+pub const CLAIM_ERR_RISK_BLOCKED: i64 = 3012;
 
 impl From<String> for ClaimError {
     fn from(message: String) -> Self {
@@ -167,6 +187,7 @@ pub fn failure_payload(
         "nextAt": err.next_at,
         "terminal": err.is_terminal(),
         "challenge": err.is_challenge(),
+        "riskBlocked": err.is_risk_blocked(),
         "message": err.message,
     })
 }
@@ -402,8 +423,23 @@ pub fn raw_marketing(
     config: Option<&Value>,
     device_mid: Option<String>,
 ) -> Result<Value, String> {
+    raw_marketing_with_seq(home, creds, config, device_mid, None)
+}
+
+/// 同 `raw_marketing`，可指定 `seq`（诊断用：验证 seq 是否影响 deliveries 下发）。
+pub fn raw_marketing_with_seq(
+    home: &Path,
+    creds: &Value,
+    config: Option<&Value>,
+    device_mid: Option<String>,
+    seq: Option<u64>,
+) -> Result<Value, String> {
     let token = raw_token(home, creds, config)?;
-    fetch_raw_json(&marketing_touch_url(), &token, device_mid, "marketing")
+    let url = match seq {
+        Some(s) => marketing_touch_url_with_seq(s),
+        None => marketing_touch_url(),
+    };
+    fetch_raw_json(&url, &token, device_mid, "marketing")
 }
 
 /// 原始 `billing/current` 响应（已生效/待生效套餐，含 starts_at / status）。
@@ -939,6 +975,53 @@ pub fn submit_claim(
     Ok(v)
 }
 
+/// 诊断用：对指定 `plan_id` 直接发起领取，**原样**返回 HTTP 状态与响应体。
+/// 用来验证「同一个 plan_id 能不能跨账号领取」，所以：
+/// - 不传 `captcha` 就不带人机校验头，直接看服务端会不会因此拒绝；
+/// - 无论成功失败都返回响应，不把错误压成文案，方便比对 code/logid。
+pub fn submit_claim_raw(
+    home: &Path,
+    creds: &Value,
+    config: Option<&Value>,
+    plan_id: &str,
+    captcha_param: Option<&str>,
+    captcha_region: Option<&str>,
+    device_mid: Option<String>,
+) -> Value {
+    let secret = zcrypto::default_secret(home);
+    let token = match claim_token(creds, config, &secret) {
+        Ok(t) => t,
+        Err(e) => return serde_json::json!({ "error": e }),
+    };
+    let mut headers = quota::zai_billing_headers_with_mid(&token, device_mid);
+    if let Some(c) = captcha_param.filter(|c| !c.trim().is_empty()) {
+        headers.push(("X-Aliyun-Captcha-Verify-Param".into(), c.trim().to_string()));
+    }
+    if let Some(r) = captcha_region.filter(|r| !r.trim().is_empty()) {
+        headers.push(("X-Aliyun-Captcha-Verify-Region".into(), r.trim().to_string()));
+    }
+    let body = serde_json::json!({ "plan_id": plan_id }).to_string();
+    match quota::zcode_http(
+        &billing_claim_url(),
+        "POST",
+        &headers,
+        Some(&body),
+        CLAIM_TIMEOUT_SECS,
+    ) {
+        Ok(resp) => {
+            let parsed: Value = serde_json::from_str(&resp.body).unwrap_or_else(|_| {
+                serde_json::json!({ "unparsedBody": resp.body })
+            });
+            serde_json::json!({
+                "httpStatus": resp.status,
+                "challenged": resp.header("x-aliyun-captcha-verify-param").is_some(),
+                "body": parsed,
+            })
+        }
+        Err(e) => serde_json::json!({ "error": e }),
+    }
+}
+
 /// HTTP 非 2xx 的领取错误分类（等价于原 `classify_claim_http_err`，改为吃 HttpResp，
 /// 这样 curl/ureq 两条通道的响应头都能参与「人机校验」判定）。
 fn claim_error_from_resp(prefix: &str, resp: &quota::HttpResp) -> ClaimError {
@@ -1162,6 +1245,7 @@ pub fn failure_message(code: i64, body: &Value) -> String {
         1005 => "claim.fail.1005",
         3001 => "claim.fail.3001",
         3007 => "claim.fail.3007",
+        3012 => "claim.fail.3012",
         401 => "claim.fail.401",
         _ => "claim.fail.generic",
     });
@@ -1169,5 +1253,38 @@ pub fn failure_message(code: i64, body: &Value) -> String {
         base
     } else {
         crate::i18n::trf("claim.fail.with_server", &[("base", &base), ("server_msg", &server_msg)])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn err(code: i64) -> ClaimError {
+        claim_error(code, &serde_json::json!({}))
+    }
+
+    /// 3012 必须单独归类：它不是终态（冷却过后换网络就可能成功），
+    /// 也不是「已领取」（那是 1003），更不是「缺校验头」（3007）。
+    #[test]
+    fn risk_blocked_is_3012_only() {
+        assert!(err(3012).is_risk_blocked());
+        assert!(!err(1003).is_risk_blocked());
+        assert!(!err(3007).is_risk_blocked());
+        assert!(err(1003).is_terminal(), "1003 是终态");
+        assert!(!err(3012).is_terminal(), "3012 不是终态，冷却后应可重试");
+    }
+
+    /// 3012 有专属文案（不能退化成 generic），且带上服务端原文便于对账。
+    #[test]
+    fn risk_blocked_message_is_specific() {
+        let generic = failure_message(-1, &serde_json::json!({}));
+        let blocked = failure_message(3012, &serde_json::json!({}));
+        assert_ne!(blocked, generic, "3012 不应回落到 claim.fail.generic");
+        let with_server = failure_message(
+            3012,
+            &serde_json::json!({"msg": "request has been blocked due to unusual activity."}),
+        );
+        assert!(with_server.contains("unusual activity"), "应保留服务端原文：{with_server}");
     }
 }

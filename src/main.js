@@ -22,6 +22,9 @@ let refreshClaim = { running: false, done: 0, total: 0, cooldownUntil: 0 };
 let acctRefreshBusy = {};
 let acctRefreshCooldown = {};
 let refreshTicker = null;
+// 「添加账号」的连点闸：点一次就已经在登录中了，再点会开第二条 OAuth flow，
+// 而两条 flow 抢同一个登录窗口，回调会落到旧 flow 上被丢弃（窗口不关、账号不入库）。
+let oauthStartBusy = false;
 
 // 活动中心：已探测到的活动（accountId -> ClaimPlan[]，含 campaign 元数据）
 let activities = {};
@@ -799,11 +802,16 @@ const actions = {
     openProviderModal({
       providers,
       onPick: async (id) => {
+        if (oauthStartBusy) return;
+        oauthStartBusy = true;
         try {
-          await invoke("oauth_begin", { provider: id });
-          toast(t("m.loginWindowOpened"), "ok", t("m.loginWindowDetail"));
+          const r = await invoke("oauth_begin", { provider: id });
+          // existing=true 表示后端复用了已开着的登录窗口（没有新开第二条 flow），用 warn 色调区分
+          toast(t("m.loginWindowOpened"), r && r.existing ? "warn" : "ok", t("m.loginWindowDetail"));
         } catch (e) {
           toast(stripErr(e), "err");
+        } finally {
+          setTimeout(() => { oauthStartBusy = false; }, 1500);
         }
       },
     });

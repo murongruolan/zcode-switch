@@ -116,10 +116,16 @@ pub struct VersionStatus {
 }
 
 pub fn version_status(home: &Path) -> VersionStatus {
+    version_status_with(home, None)
+}
+
+/// `detected` 供单测注入“本机 ZCode 版本”；正常运行传 `None` 走真实探测。
+/// 单测若依赖真实探测，用户一升级客户端就整批红，属于测试设计缺陷。
+fn version_status_with(home: &Path, detected: Option<&str>) -> VersionStatus {
     let file = cache_file(home);
     let latest = read_cache(&file);
     let stale = latest.is_none() || cache_stale(&file);
-    let reported = crate::quota::zcode_app_version_for(home);
+    let reported = crate::quota::zcode_app_version_with(home, detected);
     let client_constant = crate::quota::CLIENT_APP_VERSION.to_string();
     let constant_behind = latest
         .as_deref()
@@ -301,7 +307,7 @@ mod tests {
     #[test]
     fn version_status_without_cache_is_stale() {
         let home = temp_home("none");
-        let s = version_status(&home);
+        let s = version_status_with(&home, Some(crate::quota::CLIENT_APP_VERSION));
         assert!(s.stale, "缺缓存必须视为过期");
         assert_eq!(s.latest, None);
         assert_eq!(s.reported, crate::quota::CLIENT_APP_VERSION);
@@ -313,10 +319,16 @@ mod tests {
     fn version_status_fresh_cache_reports_latest() {
         let home = temp_home("fresh");
         write_cache_json(&home, "3.17.2", 60);
-        let s = version_status(&home);
+        let s = version_status_with(&home, Some(crate::quota::CLIENT_APP_VERSION));
         assert!(!s.stale);
         assert_eq!(s.latest.as_deref(), Some("3.17.2"));
-        assert_eq!(s.reported, "3.17.2");
+        // reported 取「探测版本 / 内置快照 / 缓存」三者最大值；注入探测版本后，
+        // 结果的下界就是常量，不能比它还旧。
+        assert!(
+            crate::quota::version_ge(&s.reported, crate::quota::CLIENT_APP_VERSION),
+            "reported={} 不应低于常量",
+            s.reported
+        );
         assert!(!s.constant_behind, "常量已升到 3.17.2，不应落后");
         assert!(s.cache_age_secs.unwrap() >= 60);
         let _ = std::fs::remove_dir_all(&home);
@@ -327,7 +339,7 @@ mod tests {
     fn version_status_flags_constant_behind() {
         let home = temp_home("behind");
         write_cache_json(&home, "99.0.0", 10);
-        let s = version_status(&home);
+        let s = version_status_with(&home, Some(crate::quota::CLIENT_APP_VERSION));
         assert_eq!(s.reported, "99.0.0", "上报取 max(常量, 缓存)");
         assert!(s.constant_behind, "常量 3.17.2 < 99.0.0，必须标记落后");
         let _ = std::fs::remove_dir_all(&home);
@@ -338,10 +350,14 @@ mod tests {
     fn version_status_expired_cache_is_stale() {
         let home = temp_home("old");
         write_cache_json(&home, "3.16.3", CACHE_TTL_SECS + 3600);
-        let s = version_status(&home);
+        let s = version_status_with(&home, Some(crate::quota::CLIENT_APP_VERSION));
         assert!(s.stale, "超过 TTL 必须标记过期");
-        // 过期缓存仍参与 max（旧值也可能比常量新），这里缓存更旧，所以上报仍取常量
-        assert_eq!(s.reported, crate::quota::CLIENT_APP_VERSION);
+        // 过期缓存仍参与 max，但这里缓存更旧，所以上报不会低于常量
+        assert!(
+            crate::quota::version_ge(&s.reported, crate::quota::CLIENT_APP_VERSION),
+            "reported={} 不应低于常量",
+            s.reported
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 

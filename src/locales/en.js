@@ -122,6 +122,7 @@ export const en = {
   "act.diagClaimedElsewhere": "Activities claimed in the official ZCode client cannot be synced into this app",
   "act.diagWindow": "Campaigns usually go live after 19:00 Beijing time; they may not be released yet",
   "act.diagEmptyChannels": "Server returned empty this time (no data from preview or marketing)",
+  "act.diagIpThrottle": "If this account really has not claimed yet, the campaign is likely used up or throttled for this network egress — switch network (e.g. mobile hotspot) and refresh",
   "act.diagPreviewError": "Plan channel error: {err}",
   "act.openDetail": "Click to view activity detail",
   "act.tipShort": "New activity: {title}",

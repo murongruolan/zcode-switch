@@ -279,6 +279,7 @@ export function openActivityModal(m) {
       ${v?.stale ? `<div class="act-diag-line">${esc(t("act.diagStale"))}</div>` : ""}
       ${v?.constantBehind ? `<div class="act-diag-line">${esc(t("act.diagBehind", { constant: v.clientConstant, latest: v.latest || t("act.notProvided") }))}</div>` : ""}
       ${m?.diag?.previewEmpty && m?.diag?.marketingEmpty ? `<div class="act-diag-line">${esc(t("act.diagEmptyChannels"))}</div>` : ""}
+      ${m?.diag?.previewEmpty && m?.diag?.marketingEmpty ? `<div class="act-diag-line">${esc(t("act.diagIpThrottle"))}</div>` : ""}
       ${m?.diag?.previewError ? `<div class="act-diag-line">${esc(t("act.diagPreviewError", { err: String(m.diag.previewError).slice(0, 120) }))}</div>` : ""}
       <div class="act-diag-line">${esc(t("act.diagWindow"))}</div>
       <div class="act-diag-line dim">${esc(t("act.diagClaimedElsewhere"))}</div>

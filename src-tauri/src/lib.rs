@@ -20,7 +20,7 @@ use std::sync::Mutex;
 use store::*;
 use tauri::menu::{MenuBuilder, MenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, Listener};
 use tauri_plugin_autostart::AutoLaunchManager;
 use tauri_plugin_dialog::DialogExt;
 
@@ -482,6 +482,65 @@ async fn claim_refresh(id: String, force: Option<bool>) -> Result<ClaimRefreshRe
     .await
 }
 
+/// 领取主流程：准备 pending + 打开验证码窗口。
+/// `force = true` 时允许对「本账号当前没下发」的 plan_id 发起领取（仅一次性诊断入口用），
+/// 正常按钮路径仍然强制要求 plan 出现在本账号的可领列表里。
+fn claim_start_inner(
+    app: &AppHandle,
+    id: &str,
+    plan_id: &str,
+    auto: bool,
+    force: bool,
+) -> Result<serde_json::Value, String> {
+    let paths = Paths::detect();
+    let mid = store::ensure_virtual_device_mid(&paths, id)?;
+    let acc = load_account(&paths, id)?;
+    // 自动轮次受风控冷却约束；手动领取是用户显式意图，放行
+    if auto && risk::is_cooling(&paths, id) {
+        return Err(i18n::tr("err.risk.cooling_auto"));
+    }
+    // 只为拿展示名与「是否真的可领」；force 模式下允许这一步失败（网络抖动不应挡住诊断）
+    let plans = claim::collect_claimable_plans(
+        &paths.home,
+        &acc.credentials,
+        acc.config.as_ref(),
+        mid.clone(),
+    );
+    match &plans {
+        Ok(list) => {
+            if list.iter().all(|p| p.plan_id != plan_id) && !force {
+                return Err(i18n::tr("err.claim.gone"));
+            }
+        }
+        Err(e) => {
+            if !force {
+                risk::observe_upstream_failure(&paths, id, e);
+                return Err(e.clone());
+            }
+        }
+    }
+    let listed = plans
+        .as_ref()
+        .ok()
+        .and_then(|list| list.iter().find(|p| p.plan_id == plan_id).cloned());
+    let display = match listed {
+        Some(p) if !p.name.is_empty() => p.name,
+        _ => plan_id.to_string(),
+    };
+
+    *pending_guard() = Some(PendingClaim {
+        account_id: acc.id.clone(),
+        account_name: acc.name.clone(),
+        plan_id: plan_id.to_string(),
+        plan_name: display.clone(),
+        credentials: acc.credentials,
+        config: acc.config,
+        device_mid: mid,
+    });
+    open_captcha_window(app, auto)?;
+    Ok(json!({ "account": acc.name, "plan": display, "forced": force }))
+}
+
 #[tauri::command]
 async fn claim_start(
     app: AppHandle,
@@ -490,43 +549,7 @@ async fn claim_start(
     auto: Option<bool>,
 ) -> Result<serde_json::Value, String> {
     let app2 = app.clone();
-    run_blocking(move || {
-        let paths = Paths::detect();
-        let mid = store::ensure_virtual_device_mid(&paths, &id)?;
-        let acc = load_account(&paths, &id)?;
-        // 自动轮次受风控冷却约束；手动领取是用户显式意图，放行
-        if auto.unwrap_or(false) && risk::is_cooling(&paths, &id) {
-            return Err(i18n::tr("err.risk.cooling_auto"));
-        }
-        let plans = claim::collect_claimable_plans(
-            &paths.home,
-            &acc.credentials,
-            acc.config.as_ref(),
-            mid.clone(),
-        )
-        .map_err(|e| {
-            risk::observe_upstream_failure(&paths, &id, &e);
-            e
-        })?;
-        let plan = plans
-            .iter()
-            .find(|p| p.plan_id == plan_id)
-            .ok_or_else(|| i18n::tr("err.claim.gone"))?;
-        let display = if plan.name.is_empty() { plan.plan_id.clone() } else { plan.name.clone() };
-
-        *pending_guard() = Some(PendingClaim {
-            account_id: acc.id.clone(),
-            account_name: acc.name.clone(),
-            plan_id: plan.plan_id.clone(),
-            plan_name: display.clone(),
-            credentials: acc.credentials,
-            config: acc.config,
-            device_mid: mid,
-        });
-        open_captcha_window(&app2, auto.unwrap_or(false))?;
-        Ok(json!({ "account": acc.name, "plan": display }))
-    })
-    .await
+    run_blocking(move || claim_start_inner(&app2, &id, &plan_id, auto.unwrap_or(false), false)).await
 }
 
 #[tauri::command]
@@ -557,6 +580,14 @@ async fn claim_captcha_submit(
         // 参考实测结论（zcode2api 2.6.5 整改）：拒码本身就是上游风险信号，换码连打只会加剧，
         // 且会白耗一次唯一重试额度。这里直接走终态失败，让用户重新发起领取（重新取验证码）。
         if let Err(e) = &res {
+            // 3012（unusual activity）/ 风控特征：必须进冷却，否则用户会继续点、越点越死。
+            // 2026-11-13 实测：新账号在新出口 IP 上「拿别人的 plan_id 强领」直接 3012。
+            // 3012 有独立业务码，按码直接记 strike；其余错误才走消息特征匹配，避免误伤。
+            if e.is_risk_blocked() {
+                risk::record_strike(&paths, &pending.account_id);
+            } else {
+                risk::observe_upstream_failure(&paths, &pending.account_id, &e.message);
+            }
             if e.is_captcha_rejected() {
                 flowlog::log(
                     "claim",
@@ -877,10 +908,30 @@ fn close_captcha_window(app: &AppHandle) {
     }
 }
 
+/// 销毁登录窗口并等 `login` 这个 label 真正释放（最多 2s）。
+/// `close()` 只是发关闭请求，事件循环处理完之前窗口还在；紧接着用同一个 label 建新窗口
+/// 会抢到残留窗口，导致新旧两条 OAuth flow 共用一个窗口。
+fn destroy_login_window(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("login") {
+        if w.destroy().is_err() {
+            let _ = w.close();
+        }
+        for _ in 0..40 {
+            if app.get_webview_window("login").is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
+
 struct PendingOAuth {
     provider: String,
     state: String,
     flow: String,
+    /// 该 flow 的服务端过期时刻（毫秒）。判断“能不能复用现有登录窗口”要用它，
+    /// 过期后复用只会让用户面对一个已经废掉的授权页。
+    expires_at_ms: u128,
 }
 
 #[derive(Clone)]
@@ -917,10 +968,35 @@ async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Val
         }
         None => None,
     };
-    *pending_oauth_guard() = None;
+    // 复用：已有登录窗口 且 当前 flow 未过期 → 只聚焦，绝不再开第二条 flow。
+    // 踩过的坑（2026-11-13 实测）：重复点「添加账号」会连开两条 flow，
+    // 旧的 `login` 窗口 `close()` 是异步的、没被真正销毁，新窗口又抢同一个 label；
+    // 结果是回调落在旧 flow 的窗口上，`flow_still_ours()` 判否 → 直接丢弃，
+    // 用户看到的就是「登录成功了但窗口不关、账号不出现」。
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
     if let Some(w) = app.get_webview_window("login") {
-        let _ = w.close();
+        let reusable = pending_oauth_guard()
+            .as_ref()
+            .map(|p| p.provider == provider && now_ms + 3_000 < p.expires_at_ms)
+            .unwrap_or(false);
+        if reusable {
+            let flow = pending_oauth_guard()
+                .as_ref()
+                .map(|p| p.flow.clone())
+                .unwrap_or_default();
+            flowlog::log(&flow, "begin-reuse", "existing login window focused");
+            let _ = w.show();
+            let _ = w.set_focus();
+            return Ok(json!({ "opened": true, "existing": true, "provider": provider }));
+        }
     }
+    *pending_oauth_guard() = None;
+    // 新开之前必须把旧窗口**真正销毁**并等 label 释放，不能只发 close() 请求。
+    let app_destroy = app.clone();
+    let _ = tauri::async_runtime::spawn_blocking(move || destroy_login_window(&app_destroy)).await;
     let flow = uuid::Uuid::new_v4().to_string();
     flowlog::log(&flow, "begin", &format!("provider={provider} proxy={}", if proxy_url.is_some() { "on" } else { "off" }));
     let mid = uuid::Uuid::new_v4().to_string();
@@ -971,6 +1047,7 @@ async fn oauth_begin(app: AppHandle, provider: String) -> Result<serde_json::Val
         provider: provider.clone(),
         state: init.state.clone(),
         flow: flow.clone(),
+        expires_at_ms: init.expires_at_ms,
     });
 
     let login_root = app
@@ -2040,6 +2117,27 @@ pub fn run() {
                         changelog::refresh_cache_with_timeout(&home, 3);
                     } else {
                         changelog::refresh_cache(&home);
+                    }
+                });
+            }
+            // 一次性诊断：`ZSWITCH_ONESHOT_CLAIM="<accountId>|<planId>"` 启动后自动对指定
+            // plan_id 发起领取（走正常验证码窗口，traceless 通过即提交），结果落 flowlog。
+            // 只由 `--claim-plan <planId> --id <accountId>` 这个命令行入口设置，正常启动不受影响。
+            if let Ok(spec) = std::env::var("ZSWITCH_ONESHOT_CLAIM") {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    let _ = handle.listen("claim://result", |event| {
+                        flowlog::log("claim", "oneshot-result", event.payload());
+                    });
+                    std::thread::sleep(std::time::Duration::from_millis(1200));
+                    let mut parts = spec.splitn(2, '|');
+                    if let (Some(id), Some(plan)) = (parts.next(), parts.next()) {
+                        let id = id.trim().to_string();
+                        let plan = plan.trim().to_string();
+                        match claim_start_inner(&handle, &id, &plan, false, true) {
+                            Ok(v) => flowlog::log("claim", "oneshot-start", &v.to_string()),
+                            Err(e) => flowlog::log("claim", "oneshot-start-err", &e),
+                        }
                     }
                 });
             }

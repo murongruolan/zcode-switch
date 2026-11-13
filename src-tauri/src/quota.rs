@@ -144,7 +144,25 @@ pub(crate) fn zcode_app_version() -> String {
 /// 只靠「探测 + 常量」时，旧构建在「缓存从未成功拉取」的情况下会退回过期常量，
 /// 这正是活动被版本门槛过滤的唯一窗口；内置快照把这一层也堵上。
 pub(crate) fn zcode_app_version_for(home: &std::path::Path) -> String {
-    let mut v = detected_app_version();
+    zcode_app_version_with(home, None)
+}
+
+/// `detected` 只为测试注入存在性：单测不能依赖“本机装的 ZCode 是哪一版”，
+/// 否则每次用户升级客户端，单测就会红（2026-11-13 实测踩到：3.17.2 → 3.18.2）。
+pub(crate) fn zcode_app_version_with(home: &std::path::Path, detected: Option<&str>) -> String {
+    // 诊断开关：`ZCODE_APP_VERSION_OVERRIDE=3.17.2` 可强制上报某个版本，
+    // 用来判断「活动为空」是否由版本门槛导致（正常运行时不要设置）。
+    if let Some(v) = std::env::var("ZCODE_APP_VERSION_OVERRIDE")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        return v;
+    }
+    let mut v = match detected {
+        Some(d) => d.to_string(),
+        None => detected_app_version(),
+    };
     for cand in [bundled_latest(), crate::changelog::cached_latest(home)]
         .into_iter()
         .flatten()

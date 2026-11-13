@@ -207,6 +207,7 @@ const ZH: &[(&str, &str)] = &[
     ("claim.fail.1005", "今日领取名额已用完"),
     ("claim.fail.3001", "领取参数错误，请刷新后重试"),
     ("claim.fail.3007", "验证码校验失败，请重试"),
+    ("claim.fail.3012", "网络环境或账号被判定异常（unusual activity），已暂停本账号领取；换一个网络出口（如手机热点）后再试"),
     ("claim.fail.401", "请先登录后再领取"),
     ("claim.fail.challenge", "触发了人机校验拦截，请在稍后的验证码窗口重新完成校验"),
     ("claim.fail.generic", "领取失败"),
@@ -226,8 +227,6 @@ const ZH: &[(&str, &str)] = &[
     ("cli.json_fail", "JSON 解析失败：{e}"),
     ("err.risk.cooling", "账号风控冷却中（约 {mins} 分钟后恢复），已暂停自动查询与领取"),
     ("err.risk.cooling_auto", "账号风控冷却中，本轮自动领取已跳过"),
-    ("err.risk.cooling", "Account is risk-cooling (recovers in ~{mins} min). Auto polling and claiming paused"),
-    ("err.risk.cooling_auto", "Account is risk-cooling — this auto round was skipped"),
     ("err.lang.unknown", "未知语言：{lang}（支持 zh / en）"),
 ];
 
@@ -379,6 +378,7 @@ const EN: &[(&str, &str)] = &[
     ("claim.fail.1005", "Today's claim quota is used up"),
     ("claim.fail.3001", "Claim parameter error — refresh and retry"),
     ("claim.fail.3007", "Captcha verification failed — retry"),
+    ("claim.fail.3012", "Network environment or account flagged (unusual activity) — claiming paused for this account; switch to another network egress (e.g. mobile hotspot) and retry"),
     ("claim.fail.401", "Log in before claiming"),
     ("claim.fail.challenge", "Blocked by bot verification. Complete the captcha challenge again in the retry window"),
     ("claim.fail.generic", "Claim failed"),
@@ -396,6 +396,8 @@ const EN: &[(&str, &str)] = &[
     ("cli.unknown_cmd", "Unknown subcommand: {cmd}"),
     ("cli.read_fail", "Read failed: {e}"),
     ("cli.json_fail", "JSON parse failed: {e}"),
+    ("err.risk.cooling", "Account is risk-cooling (recovers in ~{mins} min). Auto polling and claiming paused"),
+    ("err.risk.cooling_auto", "Account is risk-cooling — this auto round was skipped"),
     ("err.lang.unknown", "Unknown language: {lang} (supported: zh / en)"),
 ];
 
