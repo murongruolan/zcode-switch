@@ -408,28 +408,21 @@ fn seed_slot_data_root(
     Ok(())
 }
 
-/// 槽的凭据与 mid：播种到槽自己的数据根（3.17+ 真正生效的那份），
-/// 在默认实例没在跑时**兼容性地**把凭据写进 live（老版本 ZCode 没有 DATA_BASE_DIR 时的兜底），
-/// 但 deviceMid 永不写 live —— 那会把两个客户端并成同一台设备。
+/// 槽的凭据与 mid：只播种到槽**自己的**数据根。
+///
+/// 2026-11-14 起不再改写 live 根的凭据：以前「默认实例没在跑时顺手写 live」会让用户在
+/// 某个时间点打开默认客户端时，发现自己登的已经是槽里那个账号 —— ZCode 的会话列表
+/// 跟着当前登录账号走，用户就会以为「几个工程的会话全丢了」（数据其实还在）。
+/// 换默认实例的账号只能由用户显式的「切换」动作完成。
 fn apply_credentials(paths: &Paths, slot: &mut Slot) -> Result<(), String> {
     let mut creds: Option<Value> = None;
-    // 默认实例在跑时不再改写 live 根：写凭据会让活着的客户端被当成另一个账号，
-    // 写 deviceMid 会让它与槽撞成同一台设备（实测 2026-11-14 另一台机器踩到）。
-    let live_busy = default_client_pid(&store::proc_snapshot(true)).is_some();
     if let Some(aid) = slot.account_id.clone() {
         let acc = store::load_account(paths, &aid)?;
-        if !live_busy {
-            store::write_live(paths, &acc.credentials)?;
-            if let Some(cfg) = &acc.config {
-                let _ = store::write_live_config(paths, cfg);
-            }
-        } else {
-            flowlog::log(
-                "slots",
-                "skip-live-write",
-                &format!("slot={} default-client-running", slot.id),
-            );
-        }
+        flowlog::log(
+            "slots",
+            "slot-no-live-write",
+            &format!("slot={} acct={aid} (live 根凭据不动)", slot.id),
+        );
         creds = Some(acc.credentials.clone());
     }
     let mid = match slot.device_mid.clone().filter(|m| !m.is_empty()) {
@@ -816,6 +809,25 @@ pub fn create_slot(paths: &Paths, account_id: Option<String>) -> Result<Slot, St
         .map(|(i, _)| i);
     if let Some(i) = reusable {
         let id = slots[i].id.clone();
+        // **绑定账号没变**且原目录还在 → 原地复用，绝不换代：
+        // 换目录等于给这个账号一个全新的空数据根，历史会话（tasks-index / workspace）
+        // 还留在旧目录里、窗口里却全空 —— 用户会以为「会话丢了」（2026-11-14 实测反馈）。
+        let same_account = slots[i].account_id == account_id
+            && !slots[i].user_data_dir.is_empty()
+            && PathBuf::from(&slots[i].user_data_dir).is_dir();
+        if same_account {
+            slots[i].pid = 0;
+            slots[i].pid_started_at = 0;
+            slots[i].last_used_at = now_ts();
+            slots[i].app_name = format!("ZCodeSlot{id}");
+            save_slots(paths, &slots)?;
+            flowlog::log(
+                "slots",
+                "reuse-same-dir",
+                &format!("slot={id} epoch={} acct={}", slots[i].data_epoch, account_id.as_deref().unwrap_or("-")),
+            );
+            return Ok(slots[i].clone());
+        }
         let epoch = slots[i].data_epoch.saturating_add(1);
         let dir = slot_data_dir(paths, &id, epoch);
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -881,23 +893,37 @@ pub fn assign(paths: &Paths, id: &str, account_id: &str) -> Result<Slot, String>
         .iter()
         .position(|s| s.id == id)
         .ok_or_else(|| "槽不存在".to_string())?;
-    let epoch = slots[idx].data_epoch.saturating_add(1);
-    let dir = slot_data_dir(paths, id, epoch);
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let mid = store::ensure_virtual_device_mid(paths, account_id)
-        .ok()
-        .or_else(|| Some(fresh_mid(paths, &slots)));
-    slots[idx].account_id = Some(account_id.to_string());
-    slots[idx].device_mid = mid;
-    slots[idx].data_epoch = epoch;
-    slots[idx].user_data_dir = dir.to_string_lossy().to_string();
-    slots[idx].last_used_at = now_ts();
-    save_slots(paths, &slots)?;
-    flowlog::log(
-        "slots",
-        "assign",
-        &format!("slot={id} epoch={epoch} acct={account_id}"),
-    );
+    // 同一个账号再指派一次：保留原数据根，别让历史会话「看起来丢了」
+    let same = slots[idx].account_id.as_deref() == Some(account_id)
+        && !slots[idx].user_data_dir.is_empty()
+        && PathBuf::from(&slots[idx].user_data_dir).is_dir();
+    if same {
+        slots[idx].last_used_at = now_ts();
+        save_slots(paths, &slots)?;
+        flowlog::log(
+            "slots",
+            "assign-same-dir",
+            &format!("slot={id} epoch={} acct={account_id}", slots[idx].data_epoch),
+        );
+    } else {
+        let epoch = slots[idx].data_epoch.saturating_add(1);
+        let dir = slot_data_dir(paths, id, epoch);
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let mid = store::ensure_virtual_device_mid(paths, account_id)
+            .ok()
+            .or_else(|| Some(fresh_mid(paths, &slots)));
+        slots[idx].account_id = Some(account_id.to_string());
+        slots[idx].device_mid = mid;
+        slots[idx].data_epoch = epoch;
+        slots[idx].user_data_dir = dir.to_string_lossy().to_string();
+        slots[idx].last_used_at = now_ts();
+        save_slots(paths, &slots)?;
+        flowlog::log(
+            "slots",
+            "assign",
+            &format!("slot={id} epoch={epoch} acct={account_id}"),
+        );
+    }
 
     if slots[idx].running(&store::proc_snapshot(true)) {
         kill_slot(paths, id)?;
@@ -970,6 +996,141 @@ pub fn clear_all_pids(paths: &Paths) {
     if dirty {
         let _ = save_slots(paths, &slots);
     }
+}
+
+// ------------------------------------------------------- 数据根取证 / 挂载旧目录
+
+/// 列出磁盘上所有 ZCode 数据根：默认根、当前槽表指向的根、以及槽目录里残留的
+/// 旧代目录（换 epoch 后客户端不再指向它，但历史会话还在里面）。
+/// 每项带 `tasks-index.sqlite` 的体积/时间 —— 界面里「会话不见了」时，用它找到
+/// 真正存放历史的那一份，再用 `adopt_dir` 把窗口指回去。
+pub fn root_inventory(paths: &Paths) -> Vec<Value> {
+    let snap = store::proc_snapshot(false);
+    let slots = load_slots(paths);
+    let mut out = Vec::new();
+    out.push(root_entry(&paths.zcode_dir(), "default", None, None, &snap));
+    for s in slots.iter() {
+        let root = PathBuf::from(&s.user_data_dir).join(".zcode");
+        out.push(root_entry(&root, "slot", Some(s.id.clone()), s.account_id.clone(), &snap));
+    }
+    if let Ok(rd) = fs::read_dir(paths.store_dir().join("slots")) {
+        for e in rd.flatten() {
+            let base = e.path();
+            if !base.is_dir() {
+                continue;
+            }
+            let b = base.to_string_lossy().to_string();
+            if slots.iter().any(|s| s.user_data_dir.eq_ignore_ascii_case(&b)) {
+                continue;
+            }
+            let root = base.join(".zcode");
+            if root.join("v2").is_dir() {
+                out.push(root_entry(&root, "old", None, None, &snap));
+            }
+        }
+    }
+    out
+}
+
+fn root_entry(
+    root: &std::path::Path,
+    kind: &str,
+    slot_id: Option<String>,
+    account: Option<String>,
+    snap: &store::ProcSnapshot,
+) -> Value {
+    let base = root
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let idx = root.join("v2").join("tasks-index.sqlite");
+    let meta = fs::metadata(&idx).ok();
+    let modified = meta
+        .as_ref()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let ws = root.join("workspace");
+    let ws_count = fs::read_dir(&ws).map(|r| r.flatten().count()).unwrap_or(0);
+    json!({
+        "kind": kind,
+        "slot": slot_id,
+        "account": account,
+        "dir": base,
+        "root": root.to_string_lossy().to_string(),
+        "tasksIndexBytes": meta.as_ref().map(|m| m.len()).unwrap_or(0),
+        "tasksIndexModified": modified,
+        "workspaces": ws_count,
+        "running": !snap.pids_by_dir(&base).is_empty(),
+    })
+}
+
+/// 把「磁盘上已有的某个数据根」挂成一个槽并交给调用方去启动 —— 用于把窗口
+/// 指回历史会话所在的那一代目录（多开换代后旧目录原样保留，只是没有槽指向它）。
+pub fn adopt_dir(paths: &Paths, dir: &str, account_id: Option<String>) -> Result<Slot, String> {
+    let p = PathBuf::from(dir.trim().trim_matches('"'));
+    if !p.is_dir() {
+        return Err(format!("目录不存在：{}", p.display()));
+    }
+    let root = p.join(".zcode");
+    if !root.join("v2").is_dir() {
+        return Err(format!(
+            "这不是 ZCode 数据根（{} 下没有 .zcode\\v2）：{}",
+            p.display(),
+            root.display()
+        ));
+    }
+    let live = paths.zcode_dir();
+    if store::normalize_dir(&p.to_string_lossy()) == store::normalize_dir(&live.to_string_lossy()) {
+        return Err("这是默认客户端的数据根，请直接启动默认客户端，不要挂成槽".to_string());
+    }
+    let base = p.to_string_lossy().to_string();
+    let snap = store::proc_snapshot(true);
+    if !snap.pids_by_dir(&base).is_empty() {
+        return Err(format!("这个数据根正被客户端占用，先关掉它：{base}"));
+    }
+    let mut slots = load_slots(paths);
+    if let Some(s) = slots
+        .iter()
+        .find(|s| s.user_data_dir.eq_ignore_ascii_case(&base))
+    {
+        flowlog::log("slots", "adopt-existing", &format!("slot={} dir={base}", s.id));
+        return Ok(s.clone());
+    }
+    let mut n = 1usize;
+    while slots.iter().any(|s| s.id == n.to_string()) {
+        n += 1;
+    }
+    if n > MAX_SLOTS {
+        return Err(format!("槽位上限 {MAX_SLOTS} 个，先关掉不用的客户端再挂"));
+    }
+    let mid = telemetry_mid(&root)
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| pick_slot_mid(paths, account_id.as_deref(), &snap, None));
+    let slot = Slot {
+        id: n.to_string(),
+        app_name: format!("ZCodeSlot{n}"),
+        user_data_dir: base.clone(),
+        account_id,
+        device_mid: Some(mid),
+        pid: 0,
+        pid_started_at: 0,
+        data_epoch: 0,
+        created_at: now_ts(),
+        last_used_at: now_ts(),
+    };
+    slots.push(slot.clone());
+    save_slots(paths, &slots)?;
+    flowlog::log("slots", "adopt", &format!("slot={} dir={base}", slot.id));
+    Ok(slot)
+}
+
+fn telemetry_mid(root: &std::path::Path) -> Option<String> {
+    let f = root.join("v2").join("telemetry-state.json");
+    let txt = fs::read_to_string(f).ok()?;
+    let v: Value = serde_json::from_str(&txt).ok()?;
+    v.get("deviceMid")?.as_str().map(|s| s.to_string())
 }
 
 // ---------------------------------------------------------------- 视图
@@ -1176,6 +1337,34 @@ mod tests {
         let live: Value =
             serde_json::from_str(&fs::read_to_string(&live_file).unwrap()).unwrap();
         assert_eq!(live["deviceMid"], json!("LIVE-MID"));
+
+        // 有账号绑定时也不能把凭据写进 live 根：写进去等于悄悄换掉默认实例的账号，
+        // ZCode 的会话列表跟着账号走 → 用户会以为「几个工程的会话全丢了」。
+        let live_creds = v2.join("credentials.json");
+        fs::write(&live_creds, r#"{"keep":"OLD-LIVE-CREDS"}"#).unwrap();
+        {
+            let _g = crate::store_guard();
+            let acc = store::Account {
+                id: "acc-x".into(),
+                name: "x".into(),
+                created_at: "0".into(),
+                updated_at: "0".into(),
+                hash: "h".into(),
+                credentials: json!({"oauth:zai:access_token":"SLOT-ACC-TOKEN"}),
+                config: None,
+                virtual_device_mid: None,
+                virtual_arms_uid: None,
+            };
+            store::save_account(&paths, &acc).unwrap();
+        }
+        slot.account_id = Some("acc-x".into());
+        apply_credentials(&paths, &mut slot).unwrap();
+        let still_live = fs::read_to_string(&live_creds).unwrap();
+        assert!(
+            still_live.contains("OLD-LIVE-CREDS"),
+            "槽启动绝不能改写 live 根的凭据，实测: {still_live}"
+        );
+
         // 槽根里是槽自己的值
         let slot_tele = slot_zcode_root(&slot).join("v2").join("telemetry-state.json");
         let sv: Value = serde_json::from_str(&fs::read_to_string(&slot_tele).unwrap()).unwrap();
@@ -1356,8 +1545,11 @@ mod tests {
         assert!(!crate::in_store_guard());
     }
 
+    /// 复用未运行的槽：条数不增长、编号最小。
+    /// **同账号复用不换代**（否则每次多开都换个空数据根，用户的会话历史就「看起来没了」）；
+    /// 换账号才换代 —— 旧账号的 Cookies 不能串给新账号。
     #[test]
-    fn create_recycles_smallest_id_and_rotates_dir() {
+    fn create_recycles_smallest_id_and_only_rotates_on_account_change() {
         let paths = temp_paths("recycle");
         let mut dirs: Vec<String> = Vec::new();
         let mut epochs: Vec<u32> = Vec::new();
@@ -1370,10 +1562,21 @@ mod tests {
                 dirs.push(s.user_data_dir.clone());
                 epochs.push(s.data_epoch);
             }
+            // 同账号：一直用同一个数据根
+            assert_eq!(epochs, vec![0, 0, 0, 0, 0], "同账号复用不该换代");
+            assert!(
+                dirs.iter().all(|d| d == &dirs[0]),
+                "同账号复用必须留在同一个数据根里（历史会话就在这里）"
+            );
+
+            // 换账号：必须换代，且旧目录还在（历史不能丢）
+            let old = dirs[0].clone();
+            let s2 = create_slot(&paths, Some("a2".into())).unwrap();
+            assert_eq!(s2.id, "1");
+            assert_eq!(s2.data_epoch, 1, "换账号必须换代");
+            assert_ne!(s2.user_data_dir, old);
+            assert!(std::path::Path::new(&old).exists(), "旧代目录不能删");
         }
-        assert_eq!(epochs, vec![0, 1, 2, 3, 4], "每次复用都要换代");
-        let unique: std::collections::HashSet<&String> = dirs.iter().collect();
-        assert_eq!(unique.len(), dirs.len(), "每代目录必须不同");
         assert_eq!(load_slots(&paths).len(), 1, "回收不应让记录增长");
     }
 

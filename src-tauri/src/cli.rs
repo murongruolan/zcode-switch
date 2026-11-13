@@ -168,7 +168,8 @@ pub fn run(args: &[String]) -> (String, i32) {
             }))
         }
         // 只重启一个槽（白屏自救）：--id <槽号>
-        "slots-restart" => {            let Some(id) = flag(rest, "--id") else {
+        "slots-restart" => {
+            let Some(id) = flag(rest, "--id") else {
                 return (err("缺少 --id <槽号>"), 1);
             };
             let r = {
@@ -191,6 +192,36 @@ pub fn run(args: &[String]) -> (String, i32) {
             };
             match r {
                 Ok(closed) => ok(json!({ "id": id, "closed": closed })),
+                Err(e) => return (err(&e), 1),
+            }
+        }
+        // 立刻给 live 根的会话索引做一份快照（切账号前手抖跑一下也不亏）
+        "backup" => match crate::store::backup_live_index(&paths) {
+            Ok(d) => ok(json!({ "dir": d.to_string_lossy() })),
+            Err(e) => return (err(&e), 1),
+        },
+        // 磁盘上所有 ZCode 数据根（含换 epoch 后遗留的旧代目录）+ 会话索引体积/时间
+        "slots-roots" => ok(json!({ "roots": crate::slots::root_inventory(&paths) })),
+        // 把已有的旧数据根挂成槽并启动：--dir <目录> [--account <账号id>]
+        "slots-adopt" => {
+            let Some(dir) = flag(rest, "--dir") else {
+                return (err("缺少 --dir <数据根目录>"), 1);
+            };
+            let account = flag(rest, "--account");
+            let adopted = {
+                let _g = crate::store_guard();
+                crate::slots::adopt_dir(&paths, &dir, account)
+            };
+            let mut slot = match adopted {
+                Ok(s) => s,
+                Err(e) => return (err(&e), 1),
+            };
+            let r = {
+                let _g = crate::store_guard();
+                crate::slots::launch_slot(&paths, &mut slot)
+            };
+            match r {
+                Ok(pid) => ok(json!({ "id": slot.id, "dir": slot.user_data_dir, "pid": pid })),
                 Err(e) => return (err(&e), 1),
             }
         }

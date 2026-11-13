@@ -1164,6 +1164,53 @@ fn align_family_domain(paths: &Paths, target: &Account) {
     }
 }
 
+/// 给 live 根的会话索引留一份快照。切账号前调用：ZCode 的会话列表跟着当前登录
+/// 账号走，万一新账号的客户端把本地索引重写/裁剪，至少还能从这里捞回来。
+/// 备份放在 `~/.zcode-switch/backups/live-index-<时间>/`，只保留最近 10 份。
+pub fn backup_live_index(paths: &Paths) -> Result<PathBuf, String> {
+    let v2 = paths.zcode_dir().join("v2");
+    let src = v2.join("tasks-index.sqlite");
+    if !src.exists() {
+        return Err("live 根里没有 tasks-index.sqlite，无需备份".to_string());
+    }
+    let stamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let dir = paths
+        .store_dir()
+        .join("backups")
+        .join(format!("live-index-{stamp}"));
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    for name in [
+        "tasks-index.sqlite",
+        "tasks-index.sqlite-wal",
+        "tasks-index.sqlite-shm",
+    ] {
+        let s = v2.join(name);
+        if s.exists() {
+            fs::copy(&s, dir.join(name)).map_err(|e| e.to_string())?;
+        }
+    }
+    // 只留最近 10 份，按目录名（即时间戳）排序
+    let root = paths.store_dir().join("backups");
+    if let Ok(rd) = fs::read_dir(&root) {
+        let mut dirs: Vec<PathBuf> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_dir()
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map_or(false, |n| n.starts_with("live-index-"))
+            })
+            .collect();
+        dirs.sort();
+        while dirs.len() > 10 {
+            let old = dirs.remove(0);
+            let _ = fs::remove_dir_all(&old);
+        }
+    }
+    Ok(dir)
+}
+
 fn rematerialize_wiped_builtins(paths: &Paths, target: &Account) {
     if target.config.is_none() { return; }
     let Some(provider) = cred_plain(&target.credentials, "oauth:active_provider", &paths.home)
@@ -1339,6 +1386,13 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
     let accounts = list_accounts(paths)?;
 
     let preserved_as = auto_preserve(paths, &accounts, &target.hash)?;
+
+    // 换账号前把 live 根的会话索引快照一份：会话列表跟着登录账号走，
+    // 用户最怕的就是「切完号，几个工程的历史全看不见了」（2026-11-14 实测反馈）。
+    match backup_live_index(paths) {
+        Ok(d) => eprintln!("[zsw] live 会话索引已备份：{}", d.display()),
+        Err(e) => eprintln!("[zsw] 备份 live 会话索引跳过：{e}"),
+    }
 
     let creds = inject_relay_pass_hash(&target.credentials, current_relay_pass(paths).as_ref());
     write_live(paths, &creds)?;
