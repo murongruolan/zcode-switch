@@ -408,8 +408,9 @@ fn seed_slot_data_root(
     Ok(())
 }
 
-/// 槽的凭据与 mid：既写全局 live（老版本 ZCode 没有 DATA_BASE_DIR 时兜底），
-/// 也播种到槽自己的数据根（3.17+ 真正生效的那份）。
+/// 槽的凭据与 mid：播种到槽自己的数据根（3.17+ 真正生效的那份），
+/// 在默认实例没在跑时**兼容性地**把凭据写进 live（老版本 ZCode 没有 DATA_BASE_DIR 时的兜底），
+/// 但 deviceMid 永不写 live —— 那会把两个客户端并成同一台设备。
 fn apply_credentials(paths: &Paths, slot: &mut Slot) -> Result<(), String> {
     let mut creds: Option<Value> = None;
     // 默认实例在跑时不再改写 live 根：写凭据会让活着的客户端被当成另一个账号，
@@ -1066,6 +1067,31 @@ mod tests {
             }],
         };
         assert!(!slot.running(&other));
+    }
+
+    /// apply_credentials 绝不能碰 live 根的 deviceMid（撞车根因），
+    /// 槽的 mid 只能落在槽自己的数据根里。
+    #[test]
+    fn apply_credentials_leaves_live_mid_alone() {
+        let paths = temp_paths("livesafe");
+        let v2 = paths.data_root.join(".zcode").join("v2");
+        fs::create_dir_all(&v2).unwrap();
+        let live_file = v2.join("telemetry-state.json");
+        fs::write(&live_file, r#"{"deviceMid":"LIVE-MID"}"#).unwrap();
+        let mut slot = sample_slot("1");
+        slot.account_id = None;
+        slot.device_mid = Some("SLOT-MID".into());
+        slot.user_data_dir = paths.home.join("slot1").to_string_lossy().to_string();
+        apply_credentials(&paths, &mut slot).unwrap();
+        // live 根原样不动
+        let live: Value =
+            serde_json::from_str(&fs::read_to_string(&live_file).unwrap()).unwrap();
+        assert_eq!(live["deviceMid"], json!("LIVE-MID"));
+        // 槽根里是槽自己的值
+        let slot_tele = slot_zcode_root(&slot).join("v2").join("telemetry-state.json");
+        let sv: Value = serde_json::from_str(&fs::read_to_string(&slot_tele).unwrap()).unwrap();
+        assert_eq!(sv["deviceMid"], json!("SLOT-MID"));
+        let _ = fs::remove_dir_all(&paths.home);
     }
 
     /// 默认实例 = 主进程命令行里没有 `--user-data-dir`。它跑着的时候绝不能改写 live 根。
