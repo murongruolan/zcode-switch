@@ -225,6 +225,11 @@ pub fn run(args: &[String]) -> (String, i32) {
                 Err(e) => return (err(&e), 1),
             }
         }
+        // 只读统计：各数据根/并集中心各有多少会话（给「会话体检」脚本用）
+        "sessions-stats" => match crate::sessions::stats(&paths) {
+            Ok(v) => ok(v),
+            Err(e) => return (err(&e), 1),
+        },
         // 让所有窗口的会话库对齐同一份（凭据仍各自独立）：可选 --id 只同步一个槽
         "slots-sync" => {
             let r: Result<serde_json::Value, String> = {

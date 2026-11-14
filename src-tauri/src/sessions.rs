@@ -74,3 +74,8 @@ pub fn import_live(_paths: &Paths) -> Result<usize, String> {
 pub fn sync_all(_paths: &Paths) -> Result<String, String> {
     Err("会话共享目前只在 Windows 上实现".into())
 }
+
+#[cfg(not(windows))]
+pub fn stats(_paths: &Paths) -> Result<serde_json::Value, String> {
+    Err("会话共享目前只在 Windows 上实现".into())
+}

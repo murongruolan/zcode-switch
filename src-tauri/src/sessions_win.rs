@@ -451,6 +451,64 @@ pub fn sync_all(paths: &Paths) -> Result<String, String> {
     ))
 }
 
+/// 某个数据根里的会话量：(tasks 条数, session 条数)。库不存在就返回 (0, 0)。
+pub fn counts(paths: &Paths, root: &Path) -> (i64, i64) {
+    let Ok(api) = api(paths) else {
+        return (0, 0);
+    };
+    let (idx, cli) = db_files(root);
+    let mut tasks = 0i64;
+    let mut sessions = 0i64;
+    if idx.is_file() {
+        if let Ok(db) = Db::open(api, &idx) {
+            if let Ok(rows) = db.query("SELECT count(*) FROM tasks") {
+                if let Some(r) = rows.first() {
+                    tasks = r.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+                }
+            }
+        }
+    }
+    if cli.is_file() {
+        if let Ok(db) = Db::open(api, &cli) {
+            if let Ok(rows) = db.query("SELECT count(*) FROM session") {
+                if let Some(r) = rows.first() {
+                    sessions = r.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+                }
+            }
+        }
+    }
+    (tasks, sessions)
+}
+
+/// `--cli sessions-stats`：给「会话体检」脚本用的只读统计
+pub fn stats(paths: &Paths) -> Result<serde_json::Value, String> {
+    use serde_json::json;
+    let hub = hub_root(paths);
+    let (ht, hs) = counts(paths, &hub);
+    let live = paths.data_root.join(".zcode");
+    let (lt, ls) = counts(paths, &live);
+    let slots = crate::slots::load_slots(paths);
+    let snap = crate::store::proc_snapshot(true);
+    let mut list = Vec::new();
+    for s in &slots {
+        let root = PathBuf::from(&s.user_data_dir).join(".zcode");
+        let (t, c) = counts(paths, &root);
+        list.push(json!({
+            "id": s.id,
+            "account": s.account_id,
+            "root": root.to_string_lossy(),
+            "tasks": t,
+            "sessions": c,
+            "running": s.running(&snap),
+        }));
+    }
+    Ok(json!({
+        "hub": { "root": hub.to_string_lossy(), "tasks": ht, "sessions": hs, "exists": hub.join("v2").is_dir() },
+        "live": { "root": live.to_string_lossy(), "tasks": lt, "sessions": ls },
+        "slots": list,
+    }))
+}
+
 /// workspace 里的会话草稿目录：缺哪个补哪个（单个都很小，>200MB 的跳过）
 fn copy_missing_workspace(src: &Path, dst: &Path) {
     let from = src.join("workspace");
