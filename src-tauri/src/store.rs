@@ -499,11 +499,91 @@ pub(crate) fn normalize_dir(dir: &str) -> String {
         .to_ascii_lowercase()
 }
 
+// ------------------------------------------------------- 窗口可见性 / 数据根活性
+
+/// 当前拥有**可见顶层窗口**的 PID 集合。
+///
+/// 为什么要看窗口：多开时机器上常留有没有窗口的 ZCode 主进程（自重启没退净、
+/// 单实例转发后挂着）。只按「进程还在」判定，会把一个根本没有窗口的实例当成
+/// 「正在使用」，于是绿色「使用中」标在用户根本没打开的账号上。
+#[cfg(windows)]
+pub(crate) fn visible_window_pids() -> std::collections::HashSet<u32> {
+    use std::ffi::c_void;
+    type Hwnd = *mut c_void;
+    #[link(name = "user32")]
+    extern "system" {
+        fn EnumWindows(cb: extern "system" fn(Hwnd, isize) -> i32, lparam: isize) -> i32;
+        fn IsWindowVisible(h: Hwnd) -> i32;
+        fn GetWindowThreadProcessId(h: Hwnd, pid: *mut u32) -> u32;
+    }
+    static VISIBLE: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+    extern "system" fn cb(h: Hwnd, _l: isize) -> i32 {
+        unsafe {
+            if IsWindowVisible(h) != 0 {
+                let mut pid: u32 = 0;
+                GetWindowThreadProcessId(h, &mut pid);
+                if pid != 0 {
+                    if let Ok(mut g) = VISIBLE.lock() {
+                        g.push(pid);
+                    }
+                }
+            }
+        }
+        1
+    }
+    if let Ok(mut g) = VISIBLE.lock() {
+        g.clear();
+    }
+    unsafe {
+        EnumWindows(cb, 0);
+    }
+    VISIBLE
+        .lock()
+        .map(|g| g.iter().copied().collect())
+        .unwrap_or_default()
+}
+
+#[cfg(not(windows))]
+pub(crate) fn visible_window_pids() -> std::collections::HashSet<u32> {
+    std::collections::HashSet::new()
+}
+
+/// 某个 Electron userData 目录是否**正被一个活着的客户端独占**。
+///
+/// Chromium 的 `ProcessSingleton` 一直独占 `<userData>\lockfile`，进程一退出锁就放开。
+/// 这条判据不依赖命令行 —— ZCode 自重启会把 `--user-data-dir` 参数丢掉（实测本机
+/// 多个真正活着的实例命令行里都没有），只按命令行认窗口会把它们全当成「默认实例」。
+#[cfg(windows)]
+pub(crate) fn user_data_alive(dir: &std::path::Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    const SHARING_VIOLATION: i32 = 32;
+    const LOCK_VIOLATION: i32 = 33;
+    let lock = dir.join("lockfile");
+    if !lock.exists() {
+        return false;
+    }
+    // share_mode(0) = 要求独占；别人正握着会立刻 SHARING_VIOLATION。
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(0)
+        .open(&lock)
+    {
+        Ok(_) => false,
+        Err(e) => matches!(e.raw_os_error(), Some(SHARING_VIOLATION) | Some(LOCK_VIOLATION)),
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn user_data_alive(_dir: &std::path::Path) -> bool {
+    false
+}
+
+
 
 
 /// 快照缓存时长：界面刷新的粒度，比这更短的重复调用没有意义。
-const PROC_SNAP_TTL: Duration = Duration::from_millis(1000);
-/// 启动时间容差：同一进程两次采样之间 CreationDate 可能差几十毫秒。
+const PROC_SNAP_TTL: Duration = Duration::from_millis(1000);/// 启动时间容差：同一进程两次采样之间 CreationDate 可能差几十毫秒。
 const PID_TIME_TOLERANCE_MS: i64 = 2000;
 
 static PROC_SNAP: Mutex<Option<(Instant, ProcSnapshot)>> = Mutex::new(None);

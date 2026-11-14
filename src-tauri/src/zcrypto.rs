@@ -94,7 +94,7 @@ pub fn decrypt_with_secret(value: &str, secret: &str) -> Result<String, String> 
 
 pub fn decrypt_json_opt(value: Option<&str>, secret: &str) -> Option<Value> {
     let v = value?;
-    let plain = if is_encrypted(v) { decrypt_with_secret(v, secret).ok()? } else { v.to_string() };
+    let plain = decrypt_plain(v, secret)?;
     serde_json::from_str(&plain).ok()
 }
 
@@ -115,6 +115,171 @@ pub fn jwt_exp_ms(jwt: &str) -> Option<i64> {
     exp.as_i64().or_else(|| exp.as_f64().map(|f| f as i64))
         .map(|s| s.saturating_mul(1000))
 }
+
+// ---------------------------------------------------------------- enc:v2:os:（ZCode 3.18）
+
+/// ZCode 3.18 起凭据换成 `enc:v2:os:<指纹>:<nonce>.<tag>.<ct>`：
+/// 32 字节 AES-256-GCM 密钥存在**系统凭据库**（Windows Credential Manager，条目名
+/// `<hash>.ZCode Credential Encryption`），指纹 = sha256(密钥) 的前 24 个 hex 字符。
+/// 解不开就等于「不知道这个窗口登录的是谁」，界面只能拿启动时记的账号去猜 ——
+/// 用户就会看到「使用中」标在一个自己没在用的号上。
+#[cfg(windows)]
+mod keyring {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    struct Credential {
+        flags: u32,
+        cred_type: u32,
+        target_name: *const u16,
+        comment: *const u16,
+        last_written: u64,
+        blob_size: u32,
+        blob: *mut u8,
+        persist: u32,
+        attr_count: u32,
+        attributes: *mut c_void,
+        target_alias: *const u16,
+        user_name: *const u16,
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn CredEnumerateW(
+            filter: *const u16,
+            flags: u32,
+            count: *mut u32,
+            creds: *mut *mut *mut Credential,
+        ) -> i32;
+        fn CredFree(buf: *mut c_void);
+    }
+
+    const CRED_TYPE_GENERIC: u32 = 1;
+
+    /// 读出所有 ZCode 凭据密钥 → `[(指纹, 32 字节密钥)]`
+    pub(super) fn zcode_keys() -> Vec<(String, [u8; 32])> {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let mut out = Vec::new();
+        let mut count: u32 = 0;
+        let mut arr: *mut *mut Credential = std::ptr::null_mut();
+        unsafe {
+            // 过滤串是**前缀**匹配，而 ZCode 的条目名是 `<hash>.ZCode Credential Encryption`，
+            // 只能全量枚举再自己按后缀筛。
+            if CredEnumerateW(std::ptr::null(), 0, &mut count, &mut arr) == 0 || arr.is_null() {
+                return out;
+            }
+            for i in 0..count as usize {
+                let p = *arr.add(i);
+                if p.is_null() {
+                    continue;
+                }
+                let c = &*p;
+                if c.cred_type != CRED_TYPE_GENERIC
+                    || c.blob.is_null()
+                    || c.blob_size == 0
+                    || c.target_name.is_null()
+                {
+                    continue;
+                }
+                let mut name_len = 0usize;
+                while *c.target_name.add(name_len) != 0 {
+                    name_len += 1;
+                }
+                let name: Vec<u16> =
+                    std::slice::from_raw_parts(c.target_name, name_len).to_vec();
+                let name = String::from_utf16_lossy(&name);
+                if !name.to_ascii_lowercase().ends_with(".zcode credential encryption") {
+                    continue;
+                }
+                let raw: Vec<u8> = std::slice::from_raw_parts(c.blob, c.blob_size as usize).to_vec();
+                if raw.len() % 2 != 0 {
+                    continue;
+                }
+                let text: Vec<u16> = raw
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                let text = String::from_utf16_lossy(&text);
+                let Ok(key) = URL_SAFE_NO_PAD.decode(text.trim()) else {
+                    continue;
+                };
+                if key.len() != 32 {
+                    continue;
+                }
+                let mut k = [0u8; 32];
+                k.copy_from_slice(&key);
+                let fp: String = super::sha256_hex(&k).chars().take(24).collect();
+                out.push((fp, k));
+            }
+            CredFree(arr as *mut c_void);
+        }
+        out
+    }
+}
+
+#[cfg(not(windows))]
+mod keyring {
+    pub(super) fn zcode_keys() -> Vec<(String, [u8; 32])> {
+        Vec::new()
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let d = Sha256::digest(bytes);
+    let mut s = String::with_capacity(64);
+    for b in d {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// 密钥只读一次（系统凭据库里的密钥不轮换，每次认人都枚举一遍太亏）。
+fn v2_keys() -> &'static Vec<(String, [u8; 32])> {
+    static CACHE: std::sync::OnceLock<Vec<(String, [u8; 32])>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(keyring::zcode_keys)
+}
+
+/// 解 `enc:v2:os:` 载荷。载荷结构与 v1 一致（nonce / tag / 密文三段），差别只在密钥来源。
+pub fn decrypt_v2(value: &str) -> Option<String> {
+    let body = value.strip_prefix("enc:v2:os:")?;
+    let (fingerprint, rest) = body.split_once(':')?;
+    let parts: Vec<&str> = rest.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let key = v2_keys()
+        .iter()
+        .find(|(fp, _)| fp.eq_ignore_ascii_case(fingerprint))
+        .map(|(_, k)| *k)?;
+    let nonce_b = URL_SAFE_NO_PAD.decode(parts[0]).ok()?;
+    let tag_b = URL_SAFE_NO_PAD.decode(parts[1]).ok()?;
+    let mut buf = URL_SAFE_NO_PAD.decode(parts[2]).ok()?;
+    if nonce_b.len() != 12 {
+        return None;
+    }
+    let cipher = Aes256Gcm::new_from_slice(&key).ok()?;
+    buf.extend_from_slice(&tag_b);
+    let pt = cipher.decrypt(Nonce::from_slice(&nonce_b), buf.as_slice()).ok()?;
+    Some(String::from_utf8_lossy(&pt).to_string())
+}
+
+/// 统一入口：`enc:v2:os:` 走系统凭据库密钥，`enc:v1:` 走历史 fallback 密钥。
+fn decrypt_plain(value: &str, secret: &str) -> Option<String> {
+    if value.starts_with("enc:v2:os:") {
+        if let Some(p) = decrypt_v2(value) {
+            return Some(p);
+        }
+    }
+    if value.starts_with(PREFIX) {
+        return decrypt_with_secret(value, secret).ok();
+    }
+    if value.starts_with("enc:v") {
+        return None;
+    }
+    Some(value.to_string())
+}
+
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct Identity {
@@ -141,7 +306,7 @@ pub fn identity_with_secret(creds: &Value, secret: &str) -> Identity {
         None => return id,
     };
     if let Some(ap) = map.get("oauth:active_provider").and_then(|v| v.as_str()) {
-        let plain = if is_encrypted(ap) { decrypt_with_secret(ap, secret).ok() } else { Some(ap.to_string()) };
+        let plain = decrypt_plain(ap, secret);
         if let Some(p) = plain.filter(|p| !p.is_empty()) {
             id.provider = p;
         }
@@ -166,7 +331,7 @@ pub fn identity_with_secret(creds: &Value, secret: &str) -> Identity {
     if id.user_id.is_none() {
         let at_key = format!("oauth:{}:access_token", id.provider);
         if let Some(at) = map.get(at_key.as_str()).and_then(|v| v.as_str()) {
-            let plain = if is_encrypted(at) { decrypt_with_secret(at, secret).ok() } else { Some(at.to_string()) };
+            let plain = decrypt_plain(at, secret);
             if let Some(jwt) = plain.as_deref().and_then(decode_jwt) {
                 id.user_id = jwt
                     .get("user_id")

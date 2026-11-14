@@ -119,12 +119,19 @@ fn now_ts() -> i64 {
 impl Slot {
     /// 这个槽的客户端是否还活着。
     ///
-    /// 两道判据：记录的 PID 对得上（含创建时间容差）；或者**命令行里带着同一个
-    /// `--user-data-dir`** 的进程还在。后者是必须的 —— ZCode 首次启动/更新后会
-    /// 自己重新拉起主进程，PID 变了但数据目录没变，只认 PID 会把活着的槽判成死的，
-    /// 进而允许同一账号再开一个窗口（两个窗口同一个数据根 → 额度又串起来）。
+    /// 三道判据：
+    /// 1. 记录的 PID 对得上（含创建时间容差）；
+    /// 2. 命令行里带着同一个 `--user-data-dir` 的进程还在；
+    /// 3. 槽自己的 userData 目录被独占（`lockfile` 锁着）。
+    ///
+    /// 2 是必需的 —— ZCode 首次启动/更新后会自己重新拉起主进程，PID 变了但数据目录没变。
+    /// 3 是必需中的必需：自重启还会把 `--user-data-dir` **参数**一起丢掉（实测本机多个
+    /// 真正活着的实例命令行里都没有），这时 1、2 全会把活窗口判成死的，界面上就出现
+    /// 「我明明开着两个窗口，却一个都没标使用中，反而标在默认根里那个号上」。
     pub fn running(&self, snap: &store::ProcSnapshot) -> bool {
-        snap.alive(self.pid, self.pid_started_at) || snap.by_dir(&self.user_data_dir).is_some()
+        snap.alive(self.pid, self.pid_started_at)
+            || snap.by_dir(&self.user_data_dir).is_some()
+            || store::user_data_alive(Path::new(&self.user_data_dir))
     }
 
     /// 当前实际应该记的 PID：优先用按目录找回来的（客户端自重启后是新 PID）。
@@ -308,6 +315,22 @@ fn default_slot_account(paths: &Paths) -> Option<String> {
     let raw = fs::read_to_string(paths.store_dir().join("default-slot.json")).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
     v.get("account_id")?.as_str().map(|s| s.to_string())
+}
+
+/// 默认实例（用户直接启动、命令行里没有 `--user-data-dir` 的那个）的 Electron userData：
+/// `%APPDATA%\ZCode`。它是否**真的开着窗口**，用 `lockfile` 独占来判，不靠进程列表。
+fn default_user_data_dir() -> Option<PathBuf> {
+    std::env::var("APPDATA")
+        .ok()
+        .map(|a| PathBuf::from(a).join("ZCode"))
+}
+
+/// 默认实例是否真的在跑（有窗口）。多开时机器上常有残留的无窗口主进程，
+/// 只看进程列表会把它们当成「默认实例在跑」→「使用中」标到默认根里的号上。
+pub(crate) fn default_client_alive() -> bool {
+    default_user_data_dir()
+        .map(|d| store::user_data_alive(&d))
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------- mid 归属
@@ -1439,14 +1462,16 @@ pub fn in_use_map(paths: &Paths) -> HashMap<String, Vec<String>> {
     if accounts.is_empty() {
         return map;
     }
+    // 一个 ZCode 窗口都没有（全被最小化到托盘或压根没开）→ 谈不上「正在使用」。
+    // 没有这道闸门，残留的无窗口主进程会让界面凭空标出一个「使用中」。
+    let visible = store::visible_window_pids();
+    if visible.is_empty() {
+        return map;
+    }
     let slots = load_slots(paths);
     // 用缓存快照：这个函数会被 UI 每 5 秒调一次，每次 force 都跑一遍 CIM 查询太贵
     let snap = store::proc_snapshot(false);
-    let mut slot_pids: Vec<u32> = Vec::new();
     for s in &slots {
-        if let Some((pid, _)) = s.live_pid(&snap) {
-            slot_pids.push(pid);
-        }
         if !s.running(&snap) {
             continue;
         }
@@ -1458,12 +1483,10 @@ pub fn in_use_map(paths: &Paths) -> HashMap<String, Vec<String>> {
             map.entry(id).or_default().push(format!("#{}", s.id));
         }
     }
-    // 默认实例（用户自己开的那个）：主进程里扣掉所有槽占用的 PID，还有剩下的就是在跑
-    let has_external = snap
-        .mains
-        .iter()
-        .any(|p| !slot_pids.contains(p) && *p != 0);
-    if has_external {
+    // 默认实例（用户自己开的那个）：只认「它的 userData 被独占」这一条。
+    // 原来靠「主进程里扣掉槽的 PID 还剩谁」，一旦 ZCode 自重启丢掉命令行参数，
+    // 四个没有参数的残留进程会被算成外部实例，把默认根里的号标成使用中。
+    if default_client_alive() {
         let root = paths.data_root.join(".zcode");
         let aid = account_of_root(paths, &accounts, &root)
             .or_else(|| default_slot_account(paths))
@@ -1517,18 +1540,20 @@ fn build_views(paths: &Paths, slots: &[Slot], snap: &store::ProcSnapshot) -> Vec
         })
         .collect();
 
-    // 外部实例：主进程里扣掉所有槽占用的 PID，剩下的就是用户自己开的
-    let slot_pids: Vec<u32> = slots
-        .iter()
-        .filter_map(|s| s.live_pid(snap).map(|(p, _)| p))
-        .filter(|p| *p != 0)
-        .collect();
-    let external: Vec<u32> = snap
-        .mains
-        .iter()
-        .copied()
-        .filter(|p| !slot_pids.contains(p))
-        .collect();
+    // 外部实例：默认根那个 userData 目录被独占（= 真有窗口开着）才算。
+    // 从前是「主进程里扣掉槽的 PID 还剩谁」—— ZCode 自重启丢掉 `--user-data-dir` 后，
+    // 活着的槽也会被算成外部实例，界面上就多出一个根本没开的「外部实例」。
+    let external = if default_client_alive() {
+        let visible = store::visible_window_pids();
+        snap.mains
+            .iter()
+            .copied()
+            .find(|p| visible.contains(p))
+            .map(|p| vec![p])
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     if !external.is_empty() {
         // 以默认根**现在**的凭据为准，记账值只作兜底：用户在默认窗口里换过号时，
         // default-slot.json 还停在上次启动的那个号。
