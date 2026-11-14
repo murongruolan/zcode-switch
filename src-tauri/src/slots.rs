@@ -43,8 +43,13 @@ const MAX_SLOTS: usize = 32;
 const EXIT_TIMEOUT: Duration = Duration::from_secs(8);
 const EXIT_POLL: Duration = Duration::from_millis(250);
 /// 启动后的「落地」等待上限：等新进程真正开始启动，才允许下一次启动写 live 文件。
-const SETTLE_TIMEOUT: Duration = Duration::from_secs(6);
+/// 等新进程「落地」的上限。原来 6 秒会**每次都等满**（ZCode 不一定会重写
+/// `Preferences`/`Local State`，日志里几乎全是 `settle=timeout wait=60xxms`），
+/// 切号 / 多开都被白等 6 秒。现在 2 秒封顶，且进程只要活着就算落地。
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 const SETTLE_POLL: Duration = Duration::from_millis(100);
+/// 进程存活的最短观察窗：过了这个点还活着，就不再要求 userData 文件被重写。
+const SETTLE_ALIVE_AFTER: Duration = Duration::from_millis(900);
 /// slots.json 的落盘版本。读取端同时兼容旧的无版本数组格式。
 const SLOT_FILE_VERSION: u32 = 2;
 
@@ -475,7 +480,30 @@ pub fn heal_live_mid_collision(paths: &Paths) -> Option<(String, String)> {
 /// 启动后的落地判定：等新进程在 userData 下写出启动痕迹，再放闸门。
 /// 有痕迹（Electron 已完成 profile 初始化）通常意味着它已经读过 live 文件；
 /// 等不到就用超时兜底，绝不无限等。
-fn settle_after_spawn(slot: &Slot, spawn_at_ms: i64) -> (&'static str, u128) {
+/// 进程还活着吗？用定向 `tasklist` 查一个 PID（几十毫秒），比整份 CIM 快照便宜得多。
+fn pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        let out = store::no_window("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output();
+        match out {
+            Ok(o) => String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()),
+            // 查不到结果就当成活着，宁可少重试也不要误判失败
+            Err(_) => true,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+fn settle_after_spawn(slot: &Slot, spawn_at_ms: i64, pid: u32) -> (&'static str, u128) {
     if store::in_sandbox() {
         return ("sandbox", 0);
     }
@@ -496,6 +524,10 @@ fn settle_after_spawn(slot: &Slot, spawn_at_ms: i64) -> (&'static str, u128) {
                     return ("userdata", started.elapsed().as_millis());
                 }
             }
+        }
+        // 进程还活着同样算「起来了」：宁可早放行，也别白等满 2 秒
+        if started.elapsed() >= SETTLE_ALIVE_AFTER && pid_alive(pid) {
+            return ("alive", started.elapsed().as_millis());
         }
         if Instant::now() >= deadline {
             return ("timeout", started.elapsed().as_millis());
@@ -580,41 +612,69 @@ pub fn launch_slot(paths: &Paths, slot: &mut Slot) -> Result<u32, String> {
             ),
         }
     }
-    let spawn_at = now_ms();
-
-    let mut c = Command::new(&zcode_path);
-    c.arg(format!("--user-data-dir={}", slot.user_data_dir));
-    c.env_remove("ELECTRON_RUN_AS_NODE");
-    c.env("ZCODE_DESKTOP_APPLICATION_NAME", &slot.app_name);
-    c.env("ZCODE_DESKTOP_USER_DATA_DIR", &slot.user_data_dir);
-    c.env(
-        "ZCODE_DESKTOP_SESSION_DATA_DIR",
-        PathBuf::from(&slot.user_data_dir)
-            .join("session")
-            .to_string_lossy()
-            .to_string(),
-    );
-    if std::env::var("USERPROFILE").is_ok() {
-        let slot_home = PathBuf::from(&slot.user_data_dir);
-        let _ = fs::create_dir_all(&slot_home);
-        // 桌面侧配置目录与数据根同源，避免 setting.json 又落回全局。
-        c.env("ZCODE_DESKTOP_HOME_DIR", &slot_home);
-        // 关键隔离：整个 .zcode 数据根（凭据 / telemetry / 会话库 / 日志）搬进槽目录。
-        c.env("ZCODE_DATA_BASE_DIR", &slot_home);
-        // 双保险：直接指定设备 mid，不依赖文件读取时机。
-        if let Some(mid) = slot.device_mid.clone().filter(|m| !m.is_empty()) {
-            c.env("ZCODE_TELEMETRY_DEVICE_MID", mid);
+    // 起窗口。刚关掉的实例可能还握着 Electron 的单实例锁：新进程会把参数转给它、
+    // 自己立刻退出，表现为「窗口关了但没再起来，再点一次才开」。所以这里要验证
+    // 新进程确实还活着，没活就退避重开（最多 3 次）。
+    let mut pid = 0u32;
+    let mut level = "timeout";
+    let mut waited = 0u128;
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
+        let spawn_at = now_ms();
+        let mut c = Command::new(&zcode_path);
+        c.arg(format!("--user-data-dir={}", slot.user_data_dir));
+        c.env_remove("ELECTRON_RUN_AS_NODE");
+        c.env("ZCODE_DESKTOP_APPLICATION_NAME", &slot.app_name);
+        c.env("ZCODE_DESKTOP_USER_DATA_DIR", &slot.user_data_dir);
+        c.env(
+            "ZCODE_DESKTOP_SESSION_DATA_DIR",
+            PathBuf::from(&slot.user_data_dir)
+                .join("session")
+                .to_string_lossy()
+                .to_string(),
+        );
+        if std::env::var("USERPROFILE").is_ok() {
+            let slot_home = PathBuf::from(&slot.user_data_dir);
+            let _ = fs::create_dir_all(&slot_home);
+            // 桌面侧配置目录与数据根同源，避免 setting.json 又落回全局。
+            c.env("ZCODE_DESKTOP_HOME_DIR", &slot_home);
+            // 关键隔离：整个 .zcode 数据根（凭据 / telemetry / 会话库 / 日志）搬进槽目录。
+            c.env("ZCODE_DATA_BASE_DIR", &slot_home);
+            // 双保险：直接指定设备 mid，不依赖文件读取时机。
+            if let Some(mid) = slot.device_mid.clone().filter(|m| !m.is_empty()) {
+                c.env("ZCODE_TELEMETRY_DEVICE_MID", mid);
+            }
         }
+
+        let child = store::detached(c)
+            .spawn()
+            .map_err(|e| format!("启动失败: {e}"))?;
+        pid = child.id();
+        drop(child); // 进程独立运行，句柄不用留
+
+        // 等子进程真正进入启动流程再放闸门：只有它已经起来，后续启动改写 live 才安全。
+        let (l, w) = settle_after_spawn(slot, spawn_at, pid);
+        level = l;
+        waited = w;
+        if level != "timeout" {
+            break;
+        }
+        if attempts < 3 {
+            flowlog::log(
+                "slots",
+                "launch-retry",
+                &format!("slot={} pid={pid} attempt={attempts}", slot.id),
+            );
+            std::thread::sleep(Duration::from_millis(400));
+            continue;
+        }
+        break;
     }
-
-    let child = store::detached(c)
-        .spawn()
-        .map_err(|e| format!("启动失败: {e}"))?;
-    let pid = child.id();
-    drop(child); // 进程独立运行，句柄不用留
-
-    // 等子进程真正进入启动流程再放闸门：只有它已经起来，后续启动改写 live 才安全。
-    let (level, waited) = settle_after_spawn(slot, spawn_at);
+    if level == "timeout" {
+        // 三次都没落地：不假装成功，让用户看到原因，而不是「关了就没了」。
+        return Err("新窗口没能起来（可能被上一个实例的锁占着），请再点一次「切换」".into());
+    }
     let started_at = probe_started(pid);
     let mut slots = load_slots(paths);
     if let Some(s) = slots.iter_mut().find(|s| s.id == slot.id) {
@@ -633,12 +693,13 @@ pub fn launch_slot(paths: &Paths, slot: &mut Slot) -> Result<u32, String> {
         "slots",
         "launch",
         &format!(
-            "slot={} pid={} started={} settle={} wait={}ms acct={} mid={} liveMid={} liveRunning={} midFixed={} isolated={}",
+            "slot={} pid={} started={} settle={} wait={}ms attempt={} acct={} mid={} liveMid={} liveRunning={} midFixed={} isolated={}",
             slot.id,
             pid,
             started_at,
             level,
             waited,
+            attempts,
             slot.account_id.as_deref().unwrap_or("-"),
             slot.device_mid.as_deref().unwrap_or("-"),
             live_mid(paths).unwrap_or_else(|| "-".to_string()),
@@ -938,7 +999,11 @@ pub fn assign(paths: &Paths, id: &str, account_id: &str) -> Result<Slot, String>
     );
 
     if slots[idx].running(&store::proc_snapshot(true)) {
-        kill_slot(paths, id)?;
+        // 关不掉就别硬起：新进程会被上一个实例的单实例锁顶掉，最后表现为
+        // 「窗口关了、新的又没起来」。交给用户先手动关，比默默失败强。
+        if !kill_slot(paths, id)? {
+            return Err("上一个窗口没能在超时内退出，先手动关掉那个窗口再切换".into());
+        }
     }
     let mut slot = load_slots(paths)
         .into_iter()

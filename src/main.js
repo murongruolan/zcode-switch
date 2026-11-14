@@ -303,6 +303,20 @@ function noteVersion(v) {
 let slots = [];
 // 当前平台是否支持多开（后端给结论，前端不自己猜平台）
 let slotsCap = false;
+// 上一次渲染时界面用到的状态指纹：轮询时没变化就不重绘。
+// 每 5 秒整页重绘会让「切换」这类按钮在按下与抬起之间被替换掉，
+// 点击事件随之丢失，表现就是「点几次才出气泡」。
+let lastSig = "";
+
+function uiSignature(s, sl) {
+  const acc = (s?.accounts || [])
+    .map((a) => [a.id, a.name, a.is_active ? 1 : 0, (a.in_use || []).join("+"), a.jwt_expired ? 1 : 0, a.has_user_info === false ? 1 : 0].join("|"))
+    .join(",");
+  const sls = (sl || [])
+    .map((x) => [x.id, x.running ? 1 : 0, x.account_id || "-", x.account_name || "-"].join("|"))
+    .join(",");
+  return `${s?.zcode_running ? 1 : 0}#${s?.live_logged_in ? 1 : 0}#${acc}#${sls}`;
+}
 
 async function loadSlots() {
   if (!slotsCap) {
@@ -351,7 +365,9 @@ async function openSwitchPop(accountId, ev) {
   if (!slotsCap) return; // 平台不支持多开：入口本身也不该出现
   const acct = state?.accounts?.find((a) => a.id === accountId);
   if (!acct) return;
-  await loadSlots();
+  // 不再等一次 slots_list 才弹气泡：那一次调用可能要跑进程快照（几百毫秒），
+  // 点下去半天没反应就以为没点上。用 5 秒轮询缓存的那份，后台顺手刷新。
+  loadSlots().catch(() => {});
   const running = slots.filter((s) => s.running);
   const btn = ev?.currentTarget?.getBoundingClientRect
     ? ev.currentTarget
@@ -2062,6 +2078,7 @@ function render() {
   try {
     renderInner();
     clearRenderError();
+    lastSig = uiSignature(state, slots);
   } catch (e) {
     // 渲染异常绝不允许冻结整页：保留错误条 + 落盘，后续 ticker 重试
     showRenderError(e);
@@ -2423,6 +2440,8 @@ async function sweepTick() {
         if (s?.language) init(s.language);
         // 槽的运行状态必须跟着一起刷：只刷账号状态会让「使用中 / 已登录」停在几轮之前
         await loadSlots();
+        // 指纹没变就不重绘：避免每 5 秒打断一次点击（也让界面不闪）
+        if (uiSignature(state, slots) === lastSig) return;
         enrollAccounts();
         if (!uiLocked()) render();
       } catch {}
