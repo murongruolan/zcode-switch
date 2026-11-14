@@ -37,6 +37,7 @@ type FClose = unsafe extern "C" fn(*mut c_void) -> i32;
 type FErrmsg = unsafe extern "C" fn(*mut c_void) -> *const i8;
 type FBusy = unsafe extern "C" fn(*mut c_void, i32) -> i32;
 type FChanges = unsafe extern "C" fn(*mut c_void) -> i32;
+type FColumnCount = unsafe extern "C" fn(*mut c_void) -> i32;
 
 struct Api {
     open: FOpen,
@@ -44,6 +45,7 @@ struct Api {
     prepare: FPrepare,
     step: FStep,
     column_text: FColumnText,
+    column_count: FColumnCount,
     finalize: FFinalize,
     close: FClose,
     errmsg: FErrmsg,
@@ -101,6 +103,7 @@ unsafe fn load(dll: &Path) -> Option<Api> {
         prepare: sym!("sqlite3_prepare_v2", FPrepare),
         step: sym!("sqlite3_step", FStep),
         column_text: sym!("sqlite3_column_text", FColumnText),
+        column_count: sym!("sqlite3_column_count", FColumnCount),
         finalize: sym!("sqlite3_finalize", FFinalize),
         close: sym!("sqlite3_close", FClose),
         errmsg: sym!("sqlite3_errmsg", FErrmsg),
@@ -182,17 +185,20 @@ impl Db {
         loop {
             let step = unsafe { (self.api.step)(stmt) };
             if step == SQLITE_ROW {
+                // 按列数取，而不是「遇到 NULL 就停」：NULL 列会让老写法把一行截断
+                let ncols = unsafe { (self.api.column_count)(stmt) };
                 let mut row = Vec::new();
-                let mut i = 0;
-                loop {
+                for i in 0..ncols {
                     let txt = unsafe { (self.api.column_text)(stmt, i) };
                     if txt.is_null() {
-                        break;
+                        row.push(String::new());
+                    } else {
+                        row.push(
+                            unsafe { std::ffi::CStr::from_ptr(txt) }
+                                .to_string_lossy()
+                                .to_string(),
+                        );
                     }
-                    row.push(unsafe { std::ffi::CStr::from_ptr(txt) }
-                        .to_string_lossy()
-                        .to_string());
-                    i += 1;
                 }
                 out.push(row);
             } else if step == SQLITE_DONE {
@@ -213,7 +219,10 @@ impl Db {
 }
 
 /// 把 `src` 的行并进 `dst`；dst 不存在就整库拷过去。
-fn merge_db(api: &'static Api, dst: &Path, src: &Path) -> Result<usize, String> {
+///
+/// 幂等：两边都对得上唯一索引，`INSERT OR REPLACE` 重复跑不会多出行
+/// （实测 60 tasks / 238 sessions / 5,396 messages / 18,793 parts，连跑两遍数字不变）。
+fn merge_db(_paths: &Paths, api: &'static Api, dst: &Path, src: &Path) -> Result<usize, String> {
     if !src.is_file() {
         return Ok(0);
     }
@@ -221,8 +230,10 @@ fn merge_db(api: &'static Api, dst: &Path, src: &Path) -> Result<usize, String> 
         if let Some(p) = dst.parent() {
             let _ = std::fs::create_dir_all(p);
         }
-        std::fs::copy(src, dst).map_err(|e| format!("复制 {} 失败: {e}", src.display()))?;
-        return Ok(0);
+        std::fs::copy(src, dst)
+            .map_err(|e| format!("复制 {} 失败: {e}", src.display()))?;
+        // 不 return：源库若是 WAL 模式，最近的行可能还在 -wal 里，整文件拷贝会漏掉它们，
+        // 必须再走一遍 SELECT 才能读到（2026-11-14 复检发现）。
     }
     let db = Db::open(api, dst)?;
     let attach = format!("ATTACH DATABASE {} AS src", sql_lit(&src.to_string_lossy()));
@@ -234,9 +245,16 @@ fn merge_db(api: &'static Api, dst: &Path, src: &Path) -> Result<usize, String> 
     let _ = db.exec("BEGIN");
     let mut rows = 0usize;
     let mut skipped = 0usize;
+    let mut unchanged = 0usize;
     for t in tables {
         let Some(name) = t.first() else { continue };
         if name.is_empty() {
+            continue;
+        }
+        // 先比「行数 + 最大更新时刻」：完全一样就整表跳过，不再重写几万行
+        // （开窗慢的主因；纯文件 mtime 戳记会被「自己刚写过」抵消，不可靠）
+        if table_unchanged(&db, name) {
+            unchanged += 1;
             continue;
         }
         // 两边 ZCode 版本不同导致表结构不一致时跳过这张表，绝不让整次合并失败
@@ -259,9 +277,54 @@ fn merge_db(api: &'static Api, dst: &Path, src: &Path) -> Result<usize, String> 
             &format!("dst={} skipped={skipped}", dst.display()),
         );
     }
+    if unchanged > 0 {
+        crate::flowlog::log(
+            "sessions",
+            "merge-unchanged",
+            &format!("dst={} tables={unchanged}", dst.display()),
+        );
+    }
     Ok(rows)
 }
 
+/// 这张表在 src/main 里是不是完全一样（行数 + 最大 updated_at/created_at）。
+///
+/// 只比行数不够：同一个会话被改名/归档时行数不变但内容变了，靠时间戳能发现。
+/// 没有时间戳列的表退化成只比行数（这些表基本都是追加写）。
+fn table_unchanged(db: &Db, table: &str) -> bool {
+    let count_sql = format!(
+        "SELECT (SELECT count(*) FROM main.{t}), (SELECT count(*) FROM src.{t})",
+        t = sql_ident(table)
+    );
+    match db.query(&count_sql) {
+        Ok(rows) => {
+            let Some(r) = rows.first() else { return false };
+            if r.len() != 2 || r[0] != r[1] {
+                return false;
+            }
+        }
+        Err(_) => return false,
+    }
+    // 有 updated_at 就比较最大值（TEXT/INTEGER 都能比大小）
+    for col in ["updated_at", "created_at"] {
+        let sql = format!(
+            "SELECT (SELECT max({c}) FROM main.{t}), (SELECT max({c}) FROM src.{t})",
+            c = sql_ident(col),
+            t = sql_ident(table)
+        );
+        if let Ok(rows) = db.query(&sql) {
+            if let Some(r) = rows.first() {
+                if r.len() == 2 && r[0] != r[1] {
+                    return false;
+                }
+                return true;
+            }
+        }
+    }
+    true
+}
+
+/// 每个 (dst, src) 对一条戳记，文件名用 sha256 压平，避免路径里有非法字符
 pub fn hub_root(paths: &Paths) -> PathBuf {
     paths.store_dir().join("sessions-hub").join(".zcode")
 }
@@ -283,6 +346,7 @@ pub fn import_live(paths: &Paths) -> Result<usize, String> {
         return Ok(0);
     }
     let stamp_file = paths.store_dir().join("sessions-hub").join("live-stamp.txt");
+    // stamp 必须在合并**之前**采样：否则合并期间默认根又写了新会话，会被记成「已导入」而漏掉
     let now_stamp = stamp_of(&live_idx) + &stamp_of(&live_cli);
     let hub_empty = !db_files(&hub).0.is_file();
     if !hub_empty {
@@ -294,8 +358,8 @@ pub fn import_live(paths: &Paths) -> Result<usize, String> {
     }
     let api = api(paths)?;
     let (hub_idx, hub_cli) = db_files(&hub);
-    let mut n = merge_db(api, &hub_idx, &live_idx)?;
-    n += merge_db(api, &hub_cli, &live_cli)?;
+    let mut n = merge_db(paths, api, &hub_idx, &live_idx)?;
+    n += merge_db(paths, api, &hub_cli, &live_cli)?;
     let _ = std::fs::write(&stamp_file, &now_stamp);
     Ok(n)
 }
@@ -307,7 +371,7 @@ fn stamp_of(p: &Path) -> String {
                 .modified()
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
+                .map(|d| d.as_nanos())
                 .unwrap_or(0);
             format!("{}:{}\n", m.len(), t)
         }
@@ -320,10 +384,10 @@ pub fn merge_pair(paths: &Paths, hub: &Path, root: &Path) -> Result<(usize, usiz
     let api = api(paths)?;
     let (hub_idx, hub_cli) = db_files(hub);
     let (root_idx, root_cli) = db_files(root);
-    let mut into_root = merge_db(api, &root_idx, &hub_idx)?;
-    into_root += merge_db(api, &root_cli, &hub_cli)?;
-    let mut into_hub = merge_db(api, &hub_idx, &root_idx)?;
-    into_hub += merge_db(api, &hub_cli, &root_cli)?;
+    let mut into_root = merge_db(paths, api, &root_idx, &hub_idx)?;
+    into_root += merge_db(paths, api, &root_cli, &hub_cli)?;
+    let mut into_hub = merge_db(paths, api, &hub_idx, &root_idx)?;
+    into_hub += merge_db(paths, api, &hub_cli, &root_cli)?;
     Ok((into_root, into_hub))
 }
 
@@ -351,8 +415,8 @@ pub fn push(paths: &Paths, root: &Path) -> Result<usize, String> {
     let hub = ensure_hub(paths);
     let (root_idx, root_cli) = db_files(root);
     let (hub_idx, hub_cli) = db_files(&hub);
-    let mut n = merge_db(api, &hub_idx, &root_idx)?;
-    n += merge_db(api, &hub_cli, &root_cli)?;
+    let mut n = merge_db(paths, api, &hub_idx, &root_idx)?;
+    n += merge_db(paths, api, &hub_cli, &root_cli)?;
     copy_missing_workspace(root, &hub);
     Ok(n)
 }
