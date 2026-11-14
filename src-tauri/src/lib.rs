@@ -10,6 +10,7 @@ mod oauth;
 mod probe;
 mod quota;
 mod risk;
+mod sessions;
 mod slots;
 mod store;
 mod zcrypto;

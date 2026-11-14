@@ -562,6 +562,23 @@ pub fn launch_slot(paths: &Paths, slot: &mut Slot) -> Result<u32, String> {
         }
     }
     apply_credentials(paths, slot)?;
+    // 会话共享：开窗前把「并集中心」与这个窗口的会话库双向并一遍。
+    // 目标窗口还没起来，此时写它的库是安全的；失败只记日志，绝不阻断启动。
+    {
+        let root = slot_zcode_root(slot);
+        match crate::sessions::pull(paths, &root) {
+            Ok(note) => flowlog::log(
+                "slots",
+                "session-pull",
+                &format!("slot={} root={} {}", slot.id, root.display(), note),
+            ),
+            Err(e) => flowlog::log(
+                "slots",
+                "session-pull-err",
+                &format!("slot={} {e}", slot.id),
+            ),
+        }
+    }
     let spawn_at = now_ms();
 
     let mut c = Command::new(&zcode_path);
@@ -776,6 +793,18 @@ pub fn kill_slot(paths: &Paths, id: &str) -> Result<bool, String> {
     slots[idx].pid = 0;
     slots[idx].pid_started_at = 0;
     save_slots(paths, &slots)?;
+    if !still {
+        // 关干净了就把这个窗口的会话汇进并集中心，供下一个窗口开窗时拉走。
+        let root = PathBuf::from(&dir).join(".zcode");
+        match crate::sessions::push(paths, &root) {
+            Ok(n) => flowlog::log(
+                "slots",
+                "session-push",
+                &format!("slot={id} rows={n} root={}", root.display()),
+            ),
+            Err(e) => flowlog::log("slots", "session-push-err", &format!("slot={id} {e}")),
+        }
+    }
     if still {
         flowlog::log("slots", "kill-timeout", &format!("slot={id} pids={targets:?}"));
     }

@@ -225,6 +225,31 @@ pub fn run(args: &[String]) -> (String, i32) {
                 Err(e) => return (err(&e), 1),
             }
         }
+        // 让所有窗口的会话库对齐同一份（凭据仍各自独立）：可选 --id 只同步一个槽
+        "slots-sync" => {
+            let r: Result<serde_json::Value, String> = {
+                let _g = crate::store_guard();
+                match flag(rest, "--id") {
+                    Some(id) => {
+                        let slots = crate::slots::load_slots(&paths);
+                        match slots.iter().find(|s| s.id == id) {
+                            Some(s) => {
+                                let root =
+                                    std::path::PathBuf::from(&s.user_data_dir).join(".zcode");
+                                crate::sessions::pull(&paths, &root)
+                                    .map(|n| json!({ "id": id, "note": n }))
+                            }
+                            None => Err(format!("没有 {id} 号槽")),
+                        }
+                    }
+                    None => crate::sessions::sync_all(&paths).map(|n| json!({ "note": n })),
+                }
+            };
+            match r {
+                Ok(v) => ok(v),
+                Err(e) => return (err(&e), 1),
+            }
+        }
         // 给某个槽灌历史：--id <槽号> [--from <源数据根目录，默认=默认客户端根>]
         "slots-seed" => {
             let Some(id) = flag(rest, "--id") else {
