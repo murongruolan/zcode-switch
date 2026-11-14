@@ -28,7 +28,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -809,34 +809,21 @@ pub fn create_slot(paths: &Paths, account_id: Option<String>) -> Result<Slot, St
         .map(|(i, _)| i);
     if let Some(i) = reusable {
         let id = slots[i].id.clone();
-        // **绑定账号没变**且原目录还在 → 原地复用，绝不换代：
-        // 换目录等于给这个账号一个全新的空数据根，历史会话（tasks-index / workspace）
-        // 还留在旧目录里、窗口里却全空 —— 用户会以为「会话丢了」（2026-11-14 实测反馈）。
-        let same_account = slots[i].account_id == account_id
-            && !slots[i].user_data_dir.is_empty()
-            && PathBuf::from(&slots[i].user_data_dir).is_dir();
-        if same_account {
-            slots[i].pid = 0;
-            slots[i].pid_started_at = 0;
-            slots[i].last_used_at = now_ts();
-            slots[i].app_name = format!("ZCodeSlot{id}");
-            save_slots(paths, &slots)?;
-            flowlog::log(
-                "slots",
-                "reuse-same-dir",
-                &format!("slot={id} epoch={} acct={}", slots[i].data_epoch, account_id.as_deref().unwrap_or("-")),
-            );
-            return Ok(slots[i].clone());
-        }
-        let epoch = slots[i].data_epoch.saturating_add(1);
-        let dir = slot_data_dir(paths, &id, epoch);
+        // **数据根跟账号走，不跟槽号走**：同一个账号永远落在同一个目录里。
+        // 以前按「槽号 + epoch」换目录，等于同一个号每多开一次就换一个全新的空根，
+        // 历史（tasks-index / cli\db / workspace）明明还在磁盘上，窗口里却全空 —
+        // 用户会以为「多开把会话弄丢了」（2026-11-14 实测反馈）。
+        let dir = match account_id.as_deref() {
+            Some(aid) => dir_for_account(paths, &slots, aid),
+            None => keep_dir_or_epoch(paths, &slots, i),
+        };
+        let is_new = !dir.is_dir();
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let mid = pick_slot_mid(paths, account_id.as_deref(), &snap, None);
         slots[i].account_id = account_id;
         slots[i].device_mid = Some(mid);
         slots[i].pid = 0;
         slots[i].pid_started_at = 0;
-        slots[i].data_epoch = epoch;
         slots[i].user_data_dir = dir.to_string_lossy().to_string();
         slots[i].app_name = format!("ZCodeSlot{id}");
         slots[i].last_used_at = now_ts();
@@ -845,8 +832,9 @@ pub fn create_slot(paths: &Paths, account_id: Option<String>) -> Result<Slot, St
             "slots",
             "reuse",
             &format!(
-                "slot={id} epoch={epoch} acct={}",
-                slots[i].account_id.as_deref().unwrap_or("-")
+                "slot={id} acct={} dir={} new={is_new}",
+                slots[i].account_id.as_deref().unwrap_or("-"),
+                slots[i].user_data_dir
             ),
         );
         return Ok(slots[i].clone());
@@ -864,7 +852,10 @@ pub fn create_slot(paths: &Paths, account_id: Option<String>) -> Result<Slot, St
         ));
     }
     let id = n.to_string();
-    let dir = slot_data_dir(paths, &id, 0);
+    let dir = match account_id.as_deref() {
+        Some(aid) => dir_for_account(paths, &slots, aid),
+        None => slot_data_dir(paths, &id, 0),
+    };
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let device_mid = Some(pick_slot_mid(paths, account_id.as_deref(), &snap, None));
     let slot = Slot {
@@ -885,45 +876,36 @@ pub fn create_slot(paths: &Paths, account_id: Option<String>) -> Result<Slot, St
     Ok(slot)
 }
 
-/// 把账号指派到某个槽：换一代目录 → 写凭据 → 若在运行则重启该槽。
-/// 换目录是必要的：同一个槽上一次可能跑的是别的账号，它的 Cookies 还留在原目录里。
+/// 把账号指派到某个槽：写到该账号自己的数据根 → 若在运行则重启该槽。
+/// **数据根固定在账号上**（`~/.zcode-switch/profiles/<账号id>`，或它原来就在用的目录），
+/// 换账号才换目录：旧账号的 Cookies 留在它自己的目录里，互不串味。
 pub fn assign(paths: &Paths, id: &str, account_id: &str) -> Result<Slot, String> {
     let mut slots = load_slots(paths);
     let idx = slots
         .iter()
         .position(|s| s.id == id)
         .ok_or_else(|| "槽不存在".to_string())?;
-    // 同一个账号再指派一次：保留原数据根，别让历史会话「看起来丢了」
-    let same = slots[idx].account_id.as_deref() == Some(account_id)
-        && !slots[idx].user_data_dir.is_empty()
-        && PathBuf::from(&slots[idx].user_data_dir).is_dir();
-    if same {
-        slots[idx].last_used_at = now_ts();
-        save_slots(paths, &slots)?;
-        flowlog::log(
-            "slots",
-            "assign-same-dir",
-            &format!("slot={id} epoch={} acct={account_id}", slots[idx].data_epoch),
-        );
+    let cur = slots[idx].user_data_dir.clone();
+    let dir = if slots[idx].account_id.as_deref() == Some(account_id) && !cur.is_empty() && PathBuf::from(&cur).is_dir() {
+        PathBuf::from(&cur)
     } else {
-        let epoch = slots[idx].data_epoch.saturating_add(1);
-        let dir = slot_data_dir(paths, id, epoch);
-        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let mid = store::ensure_virtual_device_mid(paths, account_id)
-            .ok()
-            .or_else(|| Some(fresh_mid(paths, &slots)));
-        slots[idx].account_id = Some(account_id.to_string());
-        slots[idx].device_mid = mid;
-        slots[idx].data_epoch = epoch;
-        slots[idx].user_data_dir = dir.to_string_lossy().to_string();
-        slots[idx].last_used_at = now_ts();
-        save_slots(paths, &slots)?;
-        flowlog::log(
-            "slots",
-            "assign",
-            &format!("slot={id} epoch={epoch} acct={account_id}"),
-        );
-    }
+        dir_for_account(paths, &slots, account_id)
+    };
+    let is_new = !dir.is_dir();
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let mid = store::ensure_virtual_device_mid(paths, account_id)
+        .ok()
+        .or_else(|| Some(fresh_mid(paths, &slots)));
+    slots[idx].account_id = Some(account_id.to_string());
+    slots[idx].device_mid = mid;
+    slots[idx].user_data_dir = dir.to_string_lossy().to_string();
+    slots[idx].last_used_at = now_ts();
+    save_slots(paths, &slots)?;
+    flowlog::log(
+        "slots",
+        "assign",
+        &format!("slot={id} acct={account_id} dir={} new={is_new}", slots[idx].user_data_dir),
+    );
 
     if slots[idx].running(&store::proc_snapshot(true)) {
         kill_slot(paths, id)?;
@@ -1131,6 +1113,172 @@ fn telemetry_mid(root: &std::path::Path) -> Option<String> {
     let txt = fs::read_to_string(f).ok()?;
     let v: Value = serde_json::from_str(&txt).ok()?;
     v.get("deviceMid")?.as_str().map(|s| s.to_string())
+}
+
+/// 每个账号固定一个数据根：`~/.zcode-switch/profiles/<账号id>`。
+/// 槽号会被回收、会变，账号不会 —— 把目录挂在账号上，历史就永远跟着这个号。
+fn profile_dir(paths: &Paths, account_id: &str) -> PathBuf {
+    paths.store_dir().join("profiles").join(account_id)
+}
+
+/// 该账号应该用哪个目录：已经在用的（槽表里绑定它且目录存在）优先，其次 profiles 里的固定目录。
+fn dir_for_account(paths: &Paths, slots: &[Slot], account_id: &str) -> PathBuf {
+    if let Some(s) = slots.iter().find(|s| {
+        s.account_id.as_deref() == Some(account_id)
+            && !s.user_data_dir.is_empty()
+            && PathBuf::from(&s.user_data_dir).is_dir()
+    }) {
+        return PathBuf::from(&s.user_data_dir);
+    }
+    profile_dir(paths, account_id)
+}
+
+/// 没绑定账号的槽：原目录还在就继续用，否则按 epoch 起一个新目录。
+fn keep_dir_or_epoch(paths: &Paths, slots: &[Slot], i: usize) -> PathBuf {
+    let cur = PathBuf::from(&slots[i].user_data_dir);
+    if cur.is_dir() {
+        return cur;
+    }
+    slot_data_dir(paths, &slots[i].id, slots[i].data_epoch)
+}
+
+/// 把一份数据根里的「会话」搬进目标目录：`v2\tasks-index.sqlite`（会话列表索引）+
+/// `cli\db\db.sqlite`（消息正文）+ `workspace`（会话草稿目录）。
+///
+/// 为什么要手动搬：两个客户端各用一个数据根才有独立的账号/设备身份，会话数据也跟着
+/// 落在各自的根里 —— 想在新窗口里看到老历史，只能把老根里的会话拷过去。
+/// **源目录必须没有客户端在跑**（SQLite 边写边拷会拷出坏库），调用方负责检查。
+pub fn copy_history(dst_dir: &Path, src_root: &Path) -> Result<String, String> {
+    let dst_root = dst_dir.join(".zcode");
+    fs::create_dir_all(dst_root.join("v2")).map_err(|e| e.to_string())?;
+    let mut copied: Vec<String> = Vec::new();
+
+    // 1) 会话列表索引
+    let idx_src = src_root.join("v2").join("tasks-index.sqlite");
+    if !idx_src.exists() {
+        return Err(format!("源目录里没有 v2\\tasks-index.sqlite：{}", src_root.display()));
+    }
+    for name in ["tasks-index.sqlite", "tasks-index.sqlite-wal", "tasks-index.sqlite-shm"] {
+        let s = src_root.join("v2").join(name);
+        if s.exists() {
+            let d = dst_root.join("v2").join(name);
+            fs::copy(&s, &d).map_err(|e| format!("拷 {name} 失败：{e}"))?;
+            copied.push(name.to_string());
+        }
+    }
+
+    // 2) 消息正文库（没有就是这个版本的 ZCode 不落本地库，跳过）
+    let db_src = src_root.join("cli").join("db").join("db.sqlite");
+    if db_src.exists() {
+        let db_dst = dst_root.join("cli").join("db");
+        fs::create_dir_all(&db_dst).map_err(|e| e.to_string())?;
+        for name in ["db.sqlite", "db.sqlite-wal", "db.sqlite-shm"] {
+            let s = src_root.join("cli").join("db").join(name);
+            if s.exists() {
+                let d = db_dst.join(name);
+                fs::copy(&s, &d).map_err(|e| format!("拷 cli\\db\\{name} 失败：{e}"))?;
+                copied.push(format!("cli/db/{name}"));
+            }
+        }
+    }
+
+    // 3) workspace（会话草稿/工程目录，实测很小；超过 200MB 就跳过，避免把窗口启动拖死）
+    let ws_src = src_root.join("workspace");
+    if ws_src.is_dir() {
+        let bytes = dir_size(&ws_src);
+        if bytes <= 200 * 1024 * 1024 {
+            let ws_dst = dst_root.join("workspace");
+            copy_tree(&ws_src, &ws_dst)?;
+            copied.push(format!("workspace ({:.1} MB)", bytes as f64 / 1048576.0));
+        } else {
+            copied.push(format!("workspace 跳过（{:.0} MB 太大）", bytes as f64 / 1048576.0));
+        }
+    }
+    Ok(copied.join(" + "))
+}
+
+fn dir_size(p: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    let Ok(rd) = fs::read_dir(p) else { return 0 };
+    for e in rd.flatten() {
+        let path = e.path();
+        match e.metadata() {
+            Ok(m) if m.is_dir() => total += dir_size(&path),
+            Ok(m) => total += m.len(),
+            Err(_) => {}
+        }
+    }
+    total
+}
+
+fn copy_tree(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
+    fs::create_dir_all(dst).map_err(|e| e.to_string())?;
+    let rd = fs::read_dir(src).map_err(|e| e.to_string())?;
+    for e in rd.flatten() {
+        let from = e.path();
+        let to = dst.join(e.file_name());
+        let meta = match e.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.is_dir() {
+            copy_tree(&from, &to)?;
+        } else {
+            let _ = fs::copy(&from, &to);
+        }
+    }
+    Ok(())
+}
+
+/// 给某个槽灌历史：把源数据根（默认根或某个旧目录）的会话拷进这个槽自己的目录。
+/// 槽在跑 / 源目录在里面跑，都直接拒绝 —— 这两个都是「边写边拷」的坏场景。
+pub fn seed_history(paths: &Paths, id: &str, from: Option<&str>) -> Result<String, String> {
+    let slots = load_slots(paths);
+    let slot = slots
+        .iter()
+        .find(|s| s.id == id)
+        .ok_or_else(|| format!("槽不存在：{id}"))?
+        .clone();
+    let snap = store::proc_snapshot(true);
+    if slot.running(&snap) {
+        return Err(format!("槽 {id} 正在运行，先关掉它再灌历史"));
+    }
+    let src_root = match from {
+        Some(d) => PathBuf::from(d.trim().trim_matches('"')).join(".zcode"),
+        None => paths.zcode_dir(),
+    };
+    if !src_root.is_dir() {
+        return Err(format!("源数据根不存在：{}", src_root.display()));
+    }
+    let src_base = src_root
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    // 源目录必须没有客户端在写。默认实例的主进程命令行里没有 --user-data-dir，
+    // 靠目录匹配抓不到它 —— 必须单独判一次，否则会「边写边拷」拷出坏库
+    // （2026-11-14 实测：默认客户端在跑时先放过了这一关，把 live 的 67MB 消息库
+    //  拷进了一个槽，随后手工清掉了这份不该存在的副本）。
+    let src_is_live =
+        store::normalize_dir(&src_base) == store::normalize_dir(&paths.data_root.to_string_lossy());
+    let busy = if src_is_live {
+        default_client_pid(&snap).is_some()
+    } else {
+        !snap.pids_by_dir(&src_base).is_empty()
+    };
+    if busy {
+        return Err(format!(
+            "源目录还有客户端在跑（{}），先把它关掉再灌 —— 边写边拷会拷出坏库",
+            src_base
+        ));
+    }
+    let dst = PathBuf::from(&slot.user_data_dir);
+    let detail = copy_history(&dst, &src_root)?;
+    flowlog::log(
+        "slots",
+        "seed-history",
+        &format!("slot={id} from={} got={detail}", src_root.display()),
+    );
+    Ok(detail)
 }
 
 // ---------------------------------------------------------------- 视图
@@ -1562,22 +1710,64 @@ mod tests {
                 dirs.push(s.user_data_dir.clone());
                 epochs.push(s.data_epoch);
             }
-            // 同账号：一直用同一个数据根
+            // 同账号：一直用同一个数据根（固定落在 profiles/<账号id>）
             assert_eq!(epochs, vec![0, 0, 0, 0, 0], "同账号复用不该换代");
             assert!(
                 dirs.iter().all(|d| d == &dirs[0]),
                 "同账号复用必须留在同一个数据根里（历史会话就在这里）"
             );
+            assert!(
+                dirs[0].contains("profiles"),
+                "账号的数据根应固定在 profiles 下，实测: {}",
+                dirs[0]
+            );
 
-            // 换账号：必须换代，且旧目录还在（历史不能丢）
+            // 换账号：换到那个账号自己的目录，旧目录原样保留（历史不能丢）
             let old = dirs[0].clone();
             let s2 = create_slot(&paths, Some("a2".into())).unwrap();
             assert_eq!(s2.id, "1");
-            assert_eq!(s2.data_epoch, 1, "换账号必须换代");
-            assert_ne!(s2.user_data_dir, old);
-            assert!(std::path::Path::new(&old).exists(), "旧代目录不能删");
+            assert_ne!(s2.user_data_dir, old, "换账号必须换目录");
+            assert!(s2.user_data_dir.contains("a2"), "应落在 a2 自己的目录");
+            assert!(std::path::Path::new(&old).exists(), "旧目录不能删");
+
+            // 再切回 a1：必须回到最初那个目录（会话还在里面）
+            let s3 = create_slot(&paths, Some("a1".into())).unwrap();
+            assert_eq!(s3.user_data_dir, old, "切回同一个账号，必须回到原目录");
         }
         assert_eq!(load_slots(&paths).len(), 1, "回收不应让记录增长");
+    }
+
+    /// 灌历史：只拷会话相关的东西（索引 + 消息库 + workspace），不碰凭据。
+    #[test]
+    fn copy_history_brings_sessions_not_credentials() {
+        let paths = temp_paths("seedhistory");
+        let src = paths.data_root.join(".zcode");
+        fs::create_dir_all(src.join("v2")).unwrap();
+        fs::create_dir_all(src.join("cli").join("db")).unwrap();
+        fs::create_dir_all(src.join("workspace").join("draft-x")).unwrap();
+        fs::write(src.join("v2").join("tasks-index.sqlite"), b"INDEX").unwrap();
+        fs::write(src.join("cli").join("db").join("db.sqlite"), b"MSGS").unwrap();
+        fs::write(src.join("workspace").join("draft-x").join("a.txt"), b"hi").unwrap();
+        fs::write(src.join("v2").join("credentials.json"), b"CREDS").unwrap();
+
+        let dst = paths.home.join("profiles").join("acc1");
+        let detail = copy_history(&dst, &src).unwrap();
+        let out = dst.join(".zcode");
+        assert_eq!(fs::read(out.join("v2").join("tasks-index.sqlite")).unwrap(), b"INDEX");
+        assert_eq!(fs::read(out.join("cli").join("db").join("db.sqlite")).unwrap(), b"MSGS");
+        assert!(out.join("workspace").join("draft-x").join("a.txt").exists());
+        assert!(
+            !out.join("v2").join("credentials.json").exists(),
+            "灌历史绝不能把凭据一起拷进去（会把两个账号串成一个）"
+        );
+        assert!(detail.contains("tasks-index.sqlite"), "返回值应说明拷了什么");
+
+        // 源目录没有索引 → 明确报错，不能建出一个空壳
+        let empty_src = paths.home.join("emptyroot");
+        fs::create_dir_all(empty_src.join(".zcode")).unwrap();
+        assert!(copy_history(&paths.home.join("x"), &empty_src.join(".zcode")).is_err());
+
+        let _ = fs::remove_dir_all(&paths.home);
     }
 
     #[test]

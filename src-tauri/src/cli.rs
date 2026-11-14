@@ -225,6 +225,21 @@ pub fn run(args: &[String]) -> (String, i32) {
                 Err(e) => return (err(&e), 1),
             }
         }
+        // 给某个槽灌历史：--id <槽号> [--from <源数据根目录，默认=默认客户端根>]
+        "slots-seed" => {
+            let Some(id) = flag(rest, "--id") else {
+                return (err("缺少 --id <槽号>"), 1);
+            };
+            let from = flag(rest, "--from");
+            let r = {
+                let _g = crate::store_guard();
+                crate::slots::seed_history(&paths, &id, from.as_deref())
+            };
+            match r {
+                Ok(detail) => ok(json!({ "id": id, "copied": detail })),
+                Err(e) => return (err(&e), 1),
+            }
+        }
         // 清理未运行的槽记录；--secs 0（默认）= 全部未运行
         "slots-gc" => {
             let secs = flag(rest, "--secs")
