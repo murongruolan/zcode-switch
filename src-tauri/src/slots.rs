@@ -27,6 +27,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -343,7 +344,7 @@ fn pick_slot_mid(
 }
 
 
-fn identity_match(li: &zcrypto::Identity, acc: &store::Account, paths: &Paths) -> bool {
+pub(crate) fn identity_match(li: &zcrypto::Identity, acc: &store::Account, paths: &Paths) -> bool {
     let ai = zcrypto::account_identity(&acc.credentials, paths.home.as_path());
     (li.user_id.is_some() && li.user_id == ai.user_id)
         || (li.username.is_some() && li.username == ai.username)
@@ -1361,21 +1362,93 @@ pub fn heal_now(paths: &Paths) -> Result<usize, String> {
     Ok(fixed)
 }
 
+/// 「哪个账号正被哪个活着的窗口用着」→ `{ account_id: ["#1", "default", ...] }`
+///
+/// 判定不能只信 `slots.json` 里记的 `account_id`（那个是**启动时**绑定的，用户在窗口里
+/// 换过号之后就不准了），也不能只信默认根的 live 凭据（多开时默认根根本没在跑）。
+/// 做法：对每个活着的槽读它自己的 `.zcode\v2\credentials.json` 认人，认不出才退回记账值。
+/// 认人优先按 hash，再按 user_id / username / email —— 凭据会刷新，hash 会变。
+pub fn in_use_map(paths: &Paths) -> HashMap<String, Vec<String>> {
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    let accounts = store::list_accounts(paths).unwrap_or_default();
+    if accounts.is_empty() {
+        return map;
+    }
+    let slots = load_slots(paths);
+    // 用缓存快照：这个函数会被 UI 每 5 秒调一次，每次 force 都跑一遍 CIM 查询太贵
+    let snap = store::proc_snapshot(false);
+    let mut slot_pids: Vec<u32> = Vec::new();
+    for s in &slots {
+        if let Some((pid, _)) = s.live_pid(&snap) {
+            slot_pids.push(pid);
+        }
+        if !s.running(&snap) {
+            continue;
+        }
+        let root = slot_zcode_root(s);
+        let aid = account_of_root(paths, &accounts, &root)
+            .or_else(|| s.account_id.clone())
+            .filter(|id| accounts.iter().any(|a| &a.id == id));
+        if let Some(id) = aid {
+            map.entry(id).or_default().push(format!("#{}", s.id));
+        }
+    }
+    // 默认实例（用户自己开的那个）：主进程里扣掉所有槽占用的 PID，还有剩下的就是在跑
+    let has_external = snap
+        .mains
+        .iter()
+        .any(|p| !slot_pids.contains(p) && *p != 0);
+    if has_external {
+        let root = paths.data_root.join(".zcode");
+        let aid = account_of_root(paths, &accounts, &root)
+            .or_else(|| default_slot_account(paths))
+            .filter(|id| accounts.iter().any(|a| &a.id == id));
+        if let Some(id) = aid {
+            map.entry(id).or_default().push("default".to_string());
+        }
+    }
+    map
+}
+
+fn account_of_root(paths: &Paths, accounts: &[store::Account], root: &Path) -> Option<String> {
+    let v = store::read_creds_at(root)?;
+    if !store::is_logged_in(&v) {
+        return None;
+    }
+    let h = store::canonical_hash(&v);
+    if let Some(a) = accounts.iter().find(|a| a.hash == h) {
+        return Some(a.id.clone());
+    }
+    let li = zcrypto::account_identity(&v, paths.home.as_path());
+    if li.user_id.is_none() && li.username.is_none() && li.email.is_none() {
+        return None;
+    }
+    accounts
+        .iter()
+        .find(|a| identity_match(&li, a, paths))
+        .map(|a| a.id.clone())
+}
+
 fn build_views(paths: &Paths, slots: &[Slot], snap: &store::ProcSnapshot) -> Vec<SlotView> {
     let accounts = store::list_accounts(paths).unwrap_or_default();
     let name_of = |aid: &str| accounts.iter().find(|a| a.id == aid).map(|a| a.name.clone());
 
     let mut out: Vec<SlotView> = slots
         .iter()
-        .map(|s| SlotView {
-            id: s.id.clone(),
-            app_name: s.app_name.clone(),
-            user_data_dir: s.user_data_dir.clone(),
-            account_id: s.account_id.clone(),
-            account_name: s.account_id.as_ref().and_then(|a| name_of(a)),
-            running: s.running(snap),
-            pid: s.live_pid(snap).map(|(p, _)| p).unwrap_or(s.pid),
-            external: false,
+        .map(|s| {
+            // 绑定的账号以「窗口里实际登录的那个」为准：用户在窗口内换过号，
+            // slots.json 里记的还是启动时的账号，直接拿来显示就会张冠李戴。
+            let aid = account_of_root(paths, &accounts, &slot_zcode_root(s)).or_else(|| s.account_id.clone());
+            SlotView {
+                id: s.id.clone(),
+                app_name: s.app_name.clone(),
+                user_data_dir: s.user_data_dir.clone(),
+                account_name: aid.as_ref().and_then(|a| name_of(a)),
+                account_id: aid,
+                running: s.running(snap),
+                pid: s.live_pid(snap).map(|(p, _)| p).unwrap_or(s.pid),
+                external: false,
+            }
         })
         .collect();
 
@@ -1392,28 +1465,20 @@ fn build_views(paths: &Paths, slots: &[Slot], snap: &store::ProcSnapshot) -> Vec
         .filter(|p| !slot_pids.contains(p))
         .collect();
     if !external.is_empty() {
-        let recorded = default_slot_account(paths);
-        let active = recorded
-            .as_ref()
-            .and_then(|aid| accounts.iter().find(|a| &a.id == aid))
+        // 以默认根**现在**的凭据为准，记账值只作兜底：用户在默认窗口里换过号时，
+        // default-slot.json 还停在上次启动的那个号。
+        let active = account_of_root(paths, &accounts, &paths.data_root.join(".zcode"))
+            .and_then(|id| accounts.iter().find(|a| a.id == id).cloned())
             .or_else(|| {
-                store::read_live(paths)
-                    .ok()
-                    .flatten()
-                    .map(|v| zcrypto::account_identity(&v, paths.home.as_path()))
-                    .and_then(|li| {
-                        if li.user_id.is_none() && li.username.is_none() && li.email.is_none() {
-                            return None;
-                        }
-                        accounts.iter().find(|a| identity_match(&li, a, paths))
-                    })
+                default_slot_account(paths)
+                    .and_then(|aid| accounts.iter().find(|a| a.id == aid).cloned())
             });
         out.push(SlotView {
             id: "external".into(),
             app_name: "ZCode".into(),
             user_data_dir: String::new(),
-            account_id: active.map(|a| a.id.clone()),
-            account_name: active.map(|a| a.name.clone()),
+            account_id: active.as_ref().map(|a| a.id.clone()),
+            account_name: active.as_ref().map(|a| a.name.clone()),
             running: true,
             pid: external.first().copied().unwrap_or(0),
             external: true,

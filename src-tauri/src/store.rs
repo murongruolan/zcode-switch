@@ -178,7 +178,12 @@ pub struct AccountSummary {
     pub name: String,
     pub created_at: String,
     pub updated_at: String,
+    /// 默认数据根（`~\.zcode`）当前登录的是不是这个账号（= 「切换」按钮里的「当前」）
     pub is_active: bool,
+    /// 这个账号正被哪些**活着的**窗口用着：`#1` / `#2` 是槽号，`默认` 是用户自己开的那个。
+    /// 多开时同一账号理论上只在一个窗口，但这里用列表，UI 可以照实显示。
+    #[serde(default)]
+    pub in_use: Vec<String>,
     pub has_config: bool,
     pub has_user_info: bool,
     pub jwt_expired: bool,
@@ -356,6 +361,14 @@ pub fn read_live(paths: &Paths) -> Result<Option<Value>, String> {
         return Err(tr("err.store.not_object"));
     }
     Ok(Some(v))
+}
+
+/// 读任意数据根（不是默认根）的 `v2\credentials.json`。多开槽各有一份，
+/// 用来判断「这个窗口里现在登录的是哪个账号」。
+pub fn read_creds_at(root: &Path) -> Option<Value> {
+    let raw = fs::read_to_string(root.join("v2").join("credentials.json")).ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    if v.is_object() { Some(v) } else { None }
 }
 
 pub fn read_live_config(paths: &Paths) -> Option<Value> {
@@ -1974,15 +1987,30 @@ pub fn get_state(paths: &Paths) -> Result<AppState, String> {
     let live = read_live(paths)?;
     let live_hash = live.as_ref().map(canonical_hash);
     let live_logged_in = live.as_ref().map(is_logged_in).unwrap_or(false);
-    let active_account_id = live_hash
-        .as_ref()
-        .and_then(|h| accounts.iter().find(|a| &a.hash == h).map(|a| a.id.clone()));
     let live_identity = live
         .as_ref()
         .filter(|_| live_logged_in)
         .map(|v| zcrypto::account_identity(v, &paths.home));
+    // 认人两道判据：先 hash（逐字节相同），再 identity。凭据被刷新后 hash 会变，
+    // 只认 hash 会把「默认根登录的其实就是这个号」判成「不是任何号」——
+    // 表现为账号行没有「当前」、切换按钮显示「切换」。
+    let active_account_id = live_hash
+        .as_ref()
+        .and_then(|h| accounts.iter().find(|a| &a.hash == h).map(|a| a.id.clone()))
+        .or_else(|| {
+            let li = live_identity.as_ref()?;
+            if li.user_id.is_none() && li.username.is_none() && li.email.is_none() {
+                return None;
+            }
+            accounts
+                .iter()
+                .find(|a| crate::slots::identity_match(li, a, paths))
+                .map(|a| a.id.clone())
+        });
     let (zcode_path, zcode_path_ok) = effective_zcode_path(paths);
     let settings = load_settings(paths);
+    // 多开：谁正在被哪个活着的窗口使用。凭据刷新后 hash 会变，所以还要按 user_id/邮箱兜底匹配。
+    let in_use = crate::slots::in_use_map(paths);
     let summaries = accounts
         .iter()
         .map(|a| AccountSummary {
@@ -1990,7 +2018,8 @@ pub fn get_state(paths: &Paths) -> Result<AppState, String> {
             name: a.name.clone(),
             created_at: a.created_at.clone(),
             updated_at: a.updated_at.clone(),
-            is_active: live_hash.as_deref() == Some(a.hash.as_str()),
+            is_active: active_account_id.as_deref() == Some(a.id.as_str()),
+            in_use: in_use.get(&a.id).cloned().unwrap_or_default(),
             has_config: a.config.is_some(),
             has_user_info: crate::claim::telemetry_user_id(&paths.home, &a.credentials).is_some(),
             jwt_expired: account_jwt_expired(&a.credentials, &paths.home),

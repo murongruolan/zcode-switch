@@ -165,6 +165,14 @@ pub fn rebuild_tray(app: &AppHandle) {
             let paths = Paths::detect();
             let tip = match store::get_state(&paths) {
                 Ok(s) => {
+                    // 多开时默认根可能根本没在跑，只显示它登录的号会误导；
+                    // 有窗口在跑就报窗口数，一个都没跑才报默认根的登录状态。
+                    let running = s.accounts.iter().filter(|a| !a.in_use.is_empty()).count();
+                    let n_win = s
+                        .accounts
+                        .iter()
+                        .filter_map(|a| if a.in_use.is_empty() { None } else { Some(a.in_use.len()) })
+                        .sum::<usize>();
                     let cur = s
                         .accounts
                         .iter()
@@ -172,7 +180,14 @@ pub fn rebuild_tray(app: &AppHandle) {
                         .map(|a| a.name.clone())
                         .or_else(|| s.live_identity.as_ref().and_then(|i| i.label()))
                         .unwrap_or_else(|| if s.live_logged_in { i18n::tr("tray.unsaved") } else { i18n::tr("tray.logged_out") });
-                    format!("Z·SWITCH · {cur}")
+                    if n_win > 0 {
+                        format!(
+                            "Z·SWITCH · {}",
+                            i18n::trf("tray.windows", &[("n", &n_win.to_string()), ("accounts", &running.to_string())])
+                        )
+                    } else {
+                        format!("Z·SWITCH · {cur}")
+                    }
                 }
                 Err(_) => "Z·SWITCH".into(),
             };

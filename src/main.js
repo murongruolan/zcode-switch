@@ -2104,19 +2104,22 @@ function renderInner() {
       ? unsaved ? t("m.status.unsaved") : t("m.status.safe")
       : t("m.status.loggedOut");
 
-  // 已被某个运行中客户端占用的账号：切换按钮置灰（同一账号不能同时占两个客户端）
+  // 已被某个运行中客户端占用的账号：切换按钮置灰（同一账号不能同时占两个客户端）。
+  // 多开时「谁在用什么号」由后端按各窗口自己的 credentials.json 认定（in_use），
+  // 不能再用 slots 里启动时记的 account_id —— 用户在窗口里换过号之后那个值就过期了。
+  const whereOf = (w) => (w === "default" ? t("m.slotExternal") : t("m.slotTag") + " " + w);
   const occupiedBy = new Map();
-  for (const sl of slots) {
-    if (sl.running && sl.account_id) {
-      occupiedBy.set(
-        sl.account_id,
-        sl.external ? t("m.slotExternal") : t("m.slotTag") + " " + sl.app_name.replace("ZCodeSlot", "#"),
-      );
-    }
+  for (const a of s.accounts) {
+    const list = Array.isArray(a.in_use) ? a.in_use : [];
+    if (list.length) occupiedBy.set(a.id, list.map(whereOf).join(" · "));
   }
 
   const rows = s.accounts.map((a) => {
     const isActive = a.is_active;
+    const inUse = Array.isArray(a.in_use) ? a.in_use : [];
+    const inUseTag = inUse.length
+      ? `<span class="tag-use" title="${esc(inUse.map(whereOf).join(" · "))}">${t("btn.inUse")}</span>`
+      : "";
     if (renaming === a.id) {      return `
       <div class="row${isActive ? " active" : ""}" data-id="${a.id}">
         <span class="notch" style="background:${notchColor(a.id)}"></span>
@@ -2161,7 +2164,7 @@ function renderInner() {
       <div class="row-top">
         <span class="notch" style="background:${notchColor(a.id)}"></span>
         <div class="row-main">
-          <div class="row-name">${esc(a.name)}${tierBadgeFor(a.id)}${isActive ? `<span class="tag-use">${t("btn.inUse")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}${a.jwt_expired ? `<span class="tag-relogin" title="${esc(t("btn.jwtExpiredTitle"))}">${t("btn.jwtExpired")}</span>` : ""}</div>
+          <div class="row-name">${esc(a.name)}${tierBadgeFor(a.id)}${inUseTag}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}${a.jwt_expired ? `<span class="tag-relogin" title="${esc(t("btn.jwtExpiredTitle"))}">${t("btn.jwtExpired")}</span>` : ""}</div>
           <div class="row-meta">${meta}</div>
         </div>
         <div class="row-actions">
@@ -2413,8 +2416,16 @@ async function sweepTick() {
     setTimeout(dismissSplash, 350);
     enrollAccounts();
     sweepTick();
-    setInterval(() => {
-      invoke("get_state").then((s) => { state = s; if (s?.language) init(s.language); enrollAccounts(); if (!uiLocked()) render(); }).catch(() => {});
+    setInterval(async () => {
+      try {
+        const s = await invoke("get_state");
+        state = s;
+        if (s?.language) init(s.language);
+        // 槽的运行状态必须跟着一起刷：只刷账号状态会让「使用中 / 已登录」停在几轮之前
+        await loadSlots();
+        enrollAccounts();
+        if (!uiLocked()) render();
+      } catch {}
     }, 5000);
     setInterval(sweepTick, TICK_MS);
     setTimeout(autoClaimTick, AUTO_CLAIM_FIRST_DELAY_MS);
